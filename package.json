@@ -5,9 +5,15 @@
   "repository": "git@github.com:hienlh/ipa-to-manifest.git",
   "author": "Hieren <hienlh1298@gmail.com>",
   "license": "MIT",
+  "scripts": {
+    "build": "ncc build index.js"
+  },
   "dependencies": {
     "@actions/core": "^1.2.5",
     "@actions/github": "^4.0.0",
     "reiko-parser": "^1.0.8"
+  },
+  "devDependencies": {
+    "@vercel/ncc": "^0.24.0"
   }
 }
