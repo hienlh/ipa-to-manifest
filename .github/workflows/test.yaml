@@ -1,0 +1,20 @@
+name: Test
+
+on:
+  push:
+    tags:
+      - "*"
+
+jobs:
+  hello_world_job:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v1
+    - uses: ./
+      id: ipa_to_manifest
+      with:
+        ipaPath: 'test/Runner.ipa'
+    - name: Get the output time
+      run: echo "The time was ${{ steps.hello.outputs.time }}"
+    - name: Log result
+      run: echo ${{ steps.ipa_to_manifest.outputs.manifestPath }}

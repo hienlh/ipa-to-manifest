@@ -1,0 +1,12 @@
+name: 'Export IPA to manifest.plist'
+description: 'Export IPA to manifest.plist'
+inputs:
+  ipaPath:  # id of input
+    description: 'Path to IPA file in runner'
+    required: true
+outputs:
+  manifestPath: 
+    description: 'Path to manifest.plist file in runner'
+runs:
+  using: 'node12'
+  main: 'index.js'
