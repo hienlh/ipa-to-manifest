@@ -14,7 +14,9 @@ jobs:
       id: ipa_to_manifest
       with:
         ipaPath: 'test/Runner.ipa'
-    - name: Get the output time
-      run: echo "The time was ${{ steps.hello.outputs.time }}"
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+    - name: Log result
+      run: echo ${{ steps.create_release.outputs.upload_url }}
     - name: Log result
       run: echo ${{ steps.ipa_to_manifest.outputs.manifestPath }}

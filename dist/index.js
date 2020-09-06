@@ -6,36 +6,29 @@ module.exports =
 /***/ ((__unused_webpack_module, __unused_webpack_exports, __webpack_require__) => {
 
 const core = __webpack_require__(2186);
-const { GitHub, context } = __webpack_require__(5438);
+const github = __webpack_require__(5438);
 const pkgReader = __webpack_require__(4366);
 const fs = __webpack_require__(5747);
 const { manifestContentMaker } = __webpack_require__(3463);
+const FileType = __webpack_require__(4930);
 
 const main = async () => {
-  const github = new GitHub(process.env.GITHUB_TOKEN);
+  const [repoOwner, repoName] = process.env.GITHUB_REPOSITORY.split("/");
 
-  const { owner, repo } = context.repo;
-
-  const tagName = context.ref;
+  const tagName = github.context.ref;
 
   const tag = tagName.replace("refs/tags/", "");
-
-  const getReleaseResponse = await github.repos.getReleaseByTag({
-    owner,
-    repo,
-    tag,
-  });
-
-  const {
-    data: { upload_url: uploadUrl },
-  } = getReleaseResponse;
 
   const ipaPath = core.getInput("ipaPath");
 
   const fileName = ipaPath.split(".")[0];
 
+  const uploadUrl = `https://github.com/${repoOwner}/${repoName}/releases/download/${tag}`;
+
   const iconPath = fileName + ".png";
   const manifestPath = fileName + ".plist";
+
+  console.log((await uploadFile(ipaPath)).data.value);
 
   const data = new pkgReader(ipaPath, "ipa", { withIcon: true });
   data.parse((err, pkgInfo) => {
@@ -61,7 +54,51 @@ const main = async () => {
   });
 };
 
-main();
+/**
+ *
+ * @param {String} filePath
+ */
+const uploadFile = async (filePath) => {
+  const octokit = new github.getOctokit(process.env.GITHUB_TOKEN);
+  const [repoOwner, repoName] = process.env.GITHUB_REPOSITORY.split("/");
+
+  const tagName = github.context.ref;
+
+  const tag = tagName.replace("refs/tags/", "");
+
+  const fileName = filePath.split(".")[0].split("/").pop();
+  console.log(
+    (
+      await octokit.repos.getReleaseByTag({
+        repoOwner,
+        repoName,
+        tag,
+      })
+    ).data
+  );
+
+  const data = {
+    url: (
+      await octokit.repos.getReleaseByTag({
+        repoOwner,
+        repoName,
+        tag,
+      })
+    ).data.upload_url,
+    headers: {
+      "content-type": (await FileType.fromFile(filePath)).mime,
+      "content-length": fs.statSync(filePath).size,
+    },
+    name: fileName,
+    file: fs.readFileSync(filePath),
+  };
+  console.log(data);
+  return await octokit.repos.uploadReleaseAsset(data);
+};
+
+main().catch((e) => {
+  core.setFailed(e);
+});
 
 
 /***/ }),
@@ -8759,6 +8796,1882 @@ function createFromFd(fd, options) {
 
 /***/ }),
 
+/***/ 4126:
+/***/ ((module, __unused_webpack_exports, __webpack_require__) => {
+
+"use strict";
+
+const Token = __webpack_require__(4261);
+const strtok3 = __webpack_require__(3026);
+const {
+	stringToBytes,
+	tarHeaderChecksumMatches,
+	uint32SyncSafeToken
+} = __webpack_require__(4875);
+const supported = __webpack_require__(7860);
+
+const minimumBytes = 4100; // A fair amount of file-types are detectable within this range
+
+async function fromStream(stream) {
+	const tokenizer = await strtok3.fromStream(stream);
+	try {
+		return await fromTokenizer(tokenizer);
+	} finally {
+		await tokenizer.close();
+	}
+}
+
+async function fromBuffer(input) {
+	if (!(input instanceof Uint8Array || input instanceof ArrayBuffer || Buffer.isBuffer(input))) {
+		throw new TypeError(`Expected the \`input\` argument to be of type \`Uint8Array\` or \`Buffer\` or \`ArrayBuffer\`, got \`${typeof input}\``);
+	}
+
+	const buffer = input instanceof Buffer ? input : Buffer.from(input);
+
+	if (!(buffer && buffer.length > 1)) {
+		return;
+	}
+
+	const tokenizer = strtok3.fromBuffer(buffer);
+	return fromTokenizer(tokenizer);
+}
+
+function _check(buffer, headers, options) {
+	options = {
+		offset: 0,
+		...options
+	};
+
+	for (const [index, header] of headers.entries()) {
+		// If a bitmask is set
+		if (options.mask) {
+			// If header doesn't equal `buf` with bits masked off
+			if (header !== (options.mask[index] & buffer[index + options.offset])) {
+				return false;
+			}
+		} else if (header !== buffer[index + options.offset]) {
+			return false;
+		}
+	}
+
+	return true;
+}
+
+async function _checkSequence(sequence, tokenizer, ignoreBytes) {
+	const buffer = Buffer.alloc(minimumBytes);
+	await tokenizer.ignore(ignoreBytes);
+
+	await tokenizer.peekBuffer(buffer, {mayBeLess: true});
+
+	return buffer.includes(Buffer.from(sequence));
+}
+
+async function fromTokenizer(tokenizer) {
+	try {
+		return _fromTokenizer(tokenizer);
+	} catch (error) {
+		if (!(error instanceof strtok3.EndOfStreamError)) {
+			throw error;
+		}
+	}
+}
+
+async function _fromTokenizer(tokenizer) {
+	let buffer = Buffer.alloc(minimumBytes);
+	const bytesRead = 12;
+	const check = (header, options) => _check(buffer, header, options);
+	const checkString = (header, options) => check(stringToBytes(header), options);
+	const checkSequence = (sequence, ignoreBytes) => _checkSequence(sequence, tokenizer, ignoreBytes);
+
+	// Keep reading until EOF if the file size is unknown.
+	if (!tokenizer.fileInfo.size) {
+		tokenizer.fileInfo.size = Number.MAX_SAFE_INTEGER;
+	}
+
+	await tokenizer.peekBuffer(buffer, {length: bytesRead, mayBeLess: true});
+
+	// -- 2-byte signatures --
+
+	if (check([0x42, 0x4D])) {
+		return {
+			ext: 'bmp',
+			mime: 'image/bmp'
+		};
+	}
+
+	if (check([0x0B, 0x77])) {
+		return {
+			ext: 'ac3',
+			mime: 'audio/vnd.dolby.dd-raw'
+		};
+	}
+
+	if (check([0x78, 0x01])) {
+		return {
+			ext: 'dmg',
+			mime: 'application/x-apple-diskimage'
+		};
+	}
+
+	if (check([0x4D, 0x5A])) {
+		return {
+			ext: 'exe',
+			mime: 'application/x-msdownload'
+		};
+	}
+
+	if (check([0x25, 0x21])) {
+		await tokenizer.peekBuffer(buffer, {length: 24, mayBeLess: true});
+
+		if (checkString('PS-Adobe-', {offset: 2}) &&
+			checkString(' EPSF-', {offset: 14})) {
+			return {
+				ext: 'eps',
+				mime: 'application/eps'
+			};
+		}
+
+		return {
+			ext: 'ps',
+			mime: 'application/postscript'
+		};
+	}
+
+	if (
+		check([0x1F, 0xA0]) ||
+		check([0x1F, 0x9D])
+	) {
+		return {
+			ext: 'Z',
+			mime: 'application/x-compress'
+		};
+	}
+
+	// -- 3-byte signatures --
+
+	if (check([0xFF, 0xD8, 0xFF])) {
+		return {
+			ext: 'jpg',
+			mime: 'image/jpeg'
+		};
+	}
+
+	if (check([0x49, 0x49, 0xBC])) {
+		return {
+			ext: 'jxr',
+			mime: 'image/vnd.ms-photo'
+		};
+	}
+
+	if (check([0x1F, 0x8B, 0x8])) {
+		return {
+			ext: 'gz',
+			mime: 'application/gzip'
+		};
+	}
+
+	if (check([0x42, 0x5A, 0x68])) {
+		return {
+			ext: 'bz2',
+			mime: 'application/x-bzip2'
+		};
+	}
+
+	if (checkString('ID3')) {
+		await tokenizer.ignore(6); // Skip ID3 header until the header size
+		const id3HeaderLen = await tokenizer.readToken(uint32SyncSafeToken);
+		if (tokenizer.position + id3HeaderLen > tokenizer.fileInfo.size) {
+			// Guess file type based on ID3 header for backward compatibility
+			return {
+				ext: 'mp3',
+				mime: 'audio/mpeg'
+			};
+		}
+
+		await tokenizer.ignore(id3HeaderLen);
+		return fromTokenizer(tokenizer); // Skip ID3 header, recursion
+	}
+
+	// Musepack, SV7
+	if (checkString('MP+')) {
+		return {
+			ext: 'mpc',
+			mime: 'audio/x-musepack'
+		};
+	}
+
+	if (
+		(buffer[0] === 0x43 || buffer[0] === 0x46) &&
+		check([0x57, 0x53], {offset: 1})
+	) {
+		return {
+			ext: 'swf',
+			mime: 'application/x-shockwave-flash'
+		};
+	}
+
+	// -- 4-byte signatures --
+
+	if (check([0x47, 0x49, 0x46])) {
+		return {
+			ext: 'gif',
+			mime: 'image/gif'
+		};
+	}
+
+	if (checkString('FLIF')) {
+		return {
+			ext: 'flif',
+			mime: 'image/flif'
+		};
+	}
+
+	if (checkString('8BPS')) {
+		return {
+			ext: 'psd',
+			mime: 'image/vnd.adobe.photoshop'
+		};
+	}
+
+	if (checkString('WEBP', {offset: 8})) {
+		return {
+			ext: 'webp',
+			mime: 'image/webp'
+		};
+	}
+
+	// Musepack, SV8
+	if (checkString('MPCK')) {
+		return {
+			ext: 'mpc',
+			mime: 'audio/x-musepack'
+		};
+	}
+
+	if (checkString('FORM')) {
+		return {
+			ext: 'aif',
+			mime: 'audio/aiff'
+		};
+	}
+
+	if (checkString('icns', {offset: 0})) {
+		return {
+			ext: 'icns',
+			mime: 'image/icns'
+		};
+	}
+
+	// Zip-based file formats
+	// Need to be before the `zip` check
+	if (check([0x50, 0x4B, 0x3, 0x4])) { // Local file header signature
+		try {
+			while (tokenizer.position + 30 < tokenizer.fileInfo.size) {
+				await tokenizer.readBuffer(buffer, {length: 30});
+
+				// https://en.wikipedia.org/wiki/Zip_(file_format)#File_headers
+				const zipHeader = {
+					compressedSize: buffer.readUInt32LE(18),
+					uncompressedSize: buffer.readUInt32LE(22),
+					filenameLength: buffer.readUInt16LE(26),
+					extraFieldLength: buffer.readUInt16LE(28)
+				};
+
+				zipHeader.filename = await tokenizer.readToken(new Token.StringType(zipHeader.filenameLength, 'utf-8'));
+				await tokenizer.ignore(zipHeader.extraFieldLength);
+
+				// Assumes signed `.xpi` from addons.mozilla.org
+				if (zipHeader.filename === 'META-INF/mozilla.rsa') {
+					return {
+						ext: 'xpi',
+						mime: 'application/x-xpinstall'
+					};
+				}
+
+				if (zipHeader.filename.endsWith('.rels') || zipHeader.filename.endsWith('.xml')) {
+					const type = zipHeader.filename.split('/')[0];
+					switch (type) {
+						case '_rels':
+							break;
+						case 'word':
+							return {
+								ext: 'docx',
+								mime: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+							};
+						case 'ppt':
+							return {
+								ext: 'pptx',
+								mime: 'application/vnd.openxmlformats-officedocument.presentationml.presentation'
+							};
+						case 'xl':
+							return {
+								ext: 'xlsx',
+								mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+							};
+						default:
+							break;
+					}
+				}
+
+				if (zipHeader.filename.startsWith('xl/')) {
+					return {
+						ext: 'xlsx',
+						mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+					};
+				}
+
+				// The docx, xlsx and pptx file types extend the Office Open XML file format:
+				// https://en.wikipedia.org/wiki/Office_Open_XML_file_formats
+				// We look for:
+				// - one entry named '[Content_Types].xml' or '_rels/.rels',
+				// - one entry indicating specific type of file.
+				// MS Office, OpenOffice and LibreOffice may put the parts in different order, so the check should not rely on it.
+				if (zipHeader.filename === 'mimetype' && zipHeader.compressedSize === zipHeader.uncompressedSize) {
+					const mimeType = await tokenizer.readToken(new Token.StringType(zipHeader.compressedSize, 'utf-8'));
+
+					switch (mimeType) {
+						case 'application/epub+zip':
+							return {
+								ext: 'epub',
+								mime: 'application/epub+zip'
+							};
+						case 'application/vnd.oasis.opendocument.text':
+							return {
+								ext: 'odt',
+								mime: 'application/vnd.oasis.opendocument.text'
+							};
+						case 'application/vnd.oasis.opendocument.spreadsheet':
+							return {
+								ext: 'ods',
+								mime: 'application/vnd.oasis.opendocument.spreadsheet'
+							};
+						case 'application/vnd.oasis.opendocument.presentation':
+							return {
+								ext: 'odp',
+								mime: 'application/vnd.oasis.opendocument.presentation'
+							};
+						default:
+					}
+				}
+
+				// Try to find next header manually when current one is corrupted
+				if (zipHeader.compressedSize === 0) {
+					let nextHeaderIndex = -1;
+
+					while (nextHeaderIndex < 0 && (tokenizer.position < tokenizer.fileInfo.size)) {
+						await tokenizer.peekBuffer(buffer, {mayBeLess: true});
+
+						nextHeaderIndex = buffer.indexOf('504B0304', 0, 'hex');
+						// Move position to the next header if found, skip the whole buffer otherwise
+						await tokenizer.ignore(nextHeaderIndex >= 0 ? nextHeaderIndex : buffer.length);
+					}
+				} else {
+					await tokenizer.ignore(zipHeader.compressedSize);
+				}
+			}
+		} catch (error) {
+			if (!(error instanceof strtok3.EndOfStreamError)) {
+				throw error;
+			}
+		}
+
+		return {
+			ext: 'zip',
+			mime: 'application/zip'
+		};
+	}
+
+	if (checkString('OggS')) {
+		// This is an OGG container
+		await tokenizer.ignore(28);
+		const type = Buffer.alloc(8);
+		await tokenizer.readBuffer(type);
+
+		// Needs to be before `ogg` check
+		if (_check(type, [0x4F, 0x70, 0x75, 0x73, 0x48, 0x65, 0x61, 0x64])) {
+			return {
+				ext: 'opus',
+				mime: 'audio/opus'
+			};
+		}
+
+		// If ' theora' in header.
+		if (_check(type, [0x80, 0x74, 0x68, 0x65, 0x6F, 0x72, 0x61])) {
+			return {
+				ext: 'ogv',
+				mime: 'video/ogg'
+			};
+		}
+
+		// If '\x01video' in header.
+		if (_check(type, [0x01, 0x76, 0x69, 0x64, 0x65, 0x6F, 0x00])) {
+			return {
+				ext: 'ogm',
+				mime: 'video/ogg'
+			};
+		}
+
+		// If ' FLAC' in header  https://xiph.org/flac/faq.html
+		if (_check(type, [0x7F, 0x46, 0x4C, 0x41, 0x43])) {
+			return {
+				ext: 'oga',
+				mime: 'audio/ogg'
+			};
+		}
+
+		// 'Speex  ' in header https://en.wikipedia.org/wiki/Speex
+		if (_check(type, [0x53, 0x70, 0x65, 0x65, 0x78, 0x20, 0x20])) {
+			return {
+				ext: 'spx',
+				mime: 'audio/ogg'
+			};
+		}
+
+		// If '\x01vorbis' in header
+		if (_check(type, [0x01, 0x76, 0x6F, 0x72, 0x62, 0x69, 0x73])) {
+			return {
+				ext: 'ogg',
+				mime: 'audio/ogg'
+			};
+		}
+
+		// Default OGG container https://www.iana.org/assignments/media-types/application/ogg
+		return {
+			ext: 'ogx',
+			mime: 'application/ogg'
+		};
+	}
+
+	if (
+		check([0x50, 0x4B]) &&
+		(buffer[2] === 0x3 || buffer[2] === 0x5 || buffer[2] === 0x7) &&
+		(buffer[3] === 0x4 || buffer[3] === 0x6 || buffer[3] === 0x8)
+	) {
+		return {
+			ext: 'zip',
+			mime: 'application/zip'
+		};
+	}
+
+	//
+
+	// File Type Box (https://en.wikipedia.org/wiki/ISO_base_media_file_format)
+	// It's not required to be first, but it's recommended to be. Almost all ISO base media files start with `ftyp` box.
+	// `ftyp` box must contain a brand major identifier, which must consist of ISO 8859-1 printable characters.
+	// Here we check for 8859-1 printable characters (for simplicity, it's a mask which also catches one non-printable character).
+	if (
+		checkString('ftyp', {offset: 4}) &&
+		(buffer[8] & 0x60) !== 0x00 // Brand major, first character ASCII?
+	) {
+		// They all can have MIME `video/mp4` except `application/mp4` special-case which is hard to detect.
+		// For some cases, we're specific, everything else falls to `video/mp4` with `mp4` extension.
+		const brandMajor = buffer.toString('binary', 8, 12).replace('\0', ' ').trim();
+		switch (brandMajor) {
+			case 'avif':
+				return {ext: 'avif', mime: 'image/avif'};
+			case 'mif1':
+				return {ext: 'heic', mime: 'image/heif'};
+			case 'msf1':
+				return {ext: 'heic', mime: 'image/heif-sequence'};
+			case 'heic':
+			case 'heix':
+				return {ext: 'heic', mime: 'image/heic'};
+			case 'hevc':
+			case 'hevx':
+				return {ext: 'heic', mime: 'image/heic-sequence'};
+			case 'qt':
+				return {ext: 'mov', mime: 'video/quicktime'};
+			case 'M4V':
+			case 'M4VH':
+			case 'M4VP':
+				return {ext: 'm4v', mime: 'video/x-m4v'};
+			case 'M4P':
+				return {ext: 'm4p', mime: 'video/mp4'};
+			case 'M4B':
+				return {ext: 'm4b', mime: 'audio/mp4'};
+			case 'M4A':
+				return {ext: 'm4a', mime: 'audio/x-m4a'};
+			case 'F4V':
+				return {ext: 'f4v', mime: 'video/mp4'};
+			case 'F4P':
+				return {ext: 'f4p', mime: 'video/mp4'};
+			case 'F4A':
+				return {ext: 'f4a', mime: 'audio/mp4'};
+			case 'F4B':
+				return {ext: 'f4b', mime: 'audio/mp4'};
+			case 'crx':
+				return {ext: 'cr3', mime: 'image/x-canon-cr3'};
+			default:
+				if (brandMajor.startsWith('3g')) {
+					if (brandMajor.startsWith('3g2')) {
+						return {ext: '3g2', mime: 'video/3gpp2'};
+					}
+
+					return {ext: '3gp', mime: 'video/3gpp'};
+				}
+
+				return {ext: 'mp4', mime: 'video/mp4'};
+		}
+	}
+
+	if (checkString('MThd')) {
+		return {
+			ext: 'mid',
+			mime: 'audio/midi'
+		};
+	}
+
+	if (
+		checkString('wOFF') &&
+		(
+			check([0x00, 0x01, 0x00, 0x00], {offset: 4}) ||
+			checkString('OTTO', {offset: 4})
+		)
+	) {
+		return {
+			ext: 'woff',
+			mime: 'font/woff'
+		};
+	}
+
+	if (
+		checkString('wOF2') &&
+		(
+			check([0x00, 0x01, 0x00, 0x00], {offset: 4}) ||
+			checkString('OTTO', {offset: 4})
+		)
+	) {
+		return {
+			ext: 'woff2',
+			mime: 'font/woff2'
+		};
+	}
+
+	if (check([0xD4, 0xC3, 0xB2, 0xA1]) || check([0xA1, 0xB2, 0xC3, 0xD4])) {
+		return {
+			ext: 'pcap',
+			mime: 'application/vnd.tcpdump.pcap'
+		};
+	}
+
+	// Sony DSD Stream File (DSF)
+	if (checkString('DSD ')) {
+		return {
+			ext: 'dsf',
+			mime: 'audio/x-dsf' // Non-standard
+		};
+	}
+
+	if (checkString('LZIP')) {
+		return {
+			ext: 'lz',
+			mime: 'application/x-lzip'
+		};
+	}
+
+	if (checkString('fLaC')) {
+		return {
+			ext: 'flac',
+			mime: 'audio/x-flac'
+		};
+	}
+
+	if (check([0x42, 0x50, 0x47, 0xFB])) {
+		return {
+			ext: 'bpg',
+			mime: 'image/bpg'
+		};
+	}
+
+	if (checkString('wvpk')) {
+		return {
+			ext: 'wv',
+			mime: 'audio/wavpack'
+		};
+	}
+
+	if (checkString('%PDF')) {
+		// Check if this is an Adobe Illustrator file
+		const isAiFile = await checkSequence('Adobe Illustrator', 1350);
+		if (isAiFile) {
+			return {
+				ext: 'ai',
+				mime: 'application/postscript'
+			};
+		}
+
+		// Assume this is just a normal PDF
+		return {
+			ext: 'pdf',
+			mime: 'application/pdf'
+		};
+	}
+
+	if (check([0x00, 0x61, 0x73, 0x6D])) {
+		return {
+			ext: 'wasm',
+			mime: 'application/wasm'
+		};
+	}
+
+	// TIFF, little-endian type
+	if (check([0x49, 0x49, 0x2A, 0x0])) {
+		if (checkString('CR', {offset: 8})) {
+			return {
+				ext: 'cr2',
+				mime: 'image/x-canon-cr2'
+			};
+		}
+
+		if (check([0x1C, 0x00, 0xFE, 0x00], {offset: 8}) || check([0x1F, 0x00, 0x0B, 0x00], {offset: 8})) {
+			return {
+				ext: 'nef',
+				mime: 'image/x-nikon-nef'
+			};
+		}
+
+		if (
+			check([0x08, 0x00, 0x00, 0x00], {offset: 4}) &&
+			(check([0x2D, 0x00, 0xFE, 0x00], {offset: 8}) ||
+				check([0x27, 0x00, 0xFE, 0x00], {offset: 8}))
+		) {
+			return {
+				ext: 'dng',
+				mime: 'image/x-adobe-dng'
+			};
+		}
+
+		buffer = Buffer.alloc(24);
+		await tokenizer.peekBuffer(buffer);
+		if (
+			(check([0x10, 0xFB, 0x86, 0x01], {offset: 4}) || check([0x08, 0x00, 0x00, 0x00], {offset: 4})) &&
+			// This pattern differentiates ARW from other TIFF-ish file types:
+			check([0x00, 0xFE, 0x00, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x03, 0x01], {offset: 9})
+		) {
+			return {
+				ext: 'arw',
+				mime: 'image/x-sony-arw'
+			};
+		}
+
+		return {
+			ext: 'tif',
+			mime: 'image/tiff'
+		};
+	}
+
+	// TIFF, big-endian type
+	if (check([0x4D, 0x4D, 0x0, 0x2A])) {
+		return {
+			ext: 'tif',
+			mime: 'image/tiff'
+		};
+	}
+
+	if (checkString('MAC ')) {
+		return {
+			ext: 'ape',
+			mime: 'audio/ape'
+		};
+	}
+
+	// https://github.com/threatstack/libmagic/blob/master/magic/Magdir/matroska
+	if (check([0x1A, 0x45, 0xDF, 0xA3])) { // Root element: EBML
+		async function readField() {
+			const msb = await tokenizer.peekNumber(Token.UINT8);
+			let mask = 0x80;
+			let ic = 0; // 0 = A, 1 = B, 2 = C, 3 = D
+
+			while ((msb & mask) === 0) {
+				++ic;
+				mask >>= 1;
+			}
+
+			const id = Buffer.alloc(ic + 1);
+			await tokenizer.readBuffer(id);
+			return id;
+		}
+
+		async function readElement() {
+			const id = await readField();
+			const lenField = await readField();
+			lenField[0] ^= 0x80 >> (lenField.length - 1);
+			const nrLen = Math.min(6, lenField.length); // JavaScript can max read 6 bytes integer
+			return {
+				id: id.readUIntBE(0, id.length),
+				len: lenField.readUIntBE(lenField.length - nrLen, nrLen)
+			};
+		}
+
+		async function readChildren(level, children) {
+			while (children > 0) {
+				const e = await readElement();
+				if (e.id === 0x4282) {
+					return tokenizer.readToken(new Token.StringType(e.len, 'utf-8')); // Return DocType
+				}
+
+				await tokenizer.ignore(e.len); // ignore payload
+				--children;
+			}
+		}
+
+		const re = await readElement();
+		const docType = await readChildren(1, re.len);
+
+		switch (docType) {
+			case 'webm':
+				return {
+					ext: 'webm',
+					mime: 'video/webm'
+				};
+
+			case 'matroska':
+				return {
+					ext: 'mkv',
+					mime: 'video/x-matroska'
+				};
+
+			default:
+				return;
+		}
+	}
+
+	// RIFF file format which might be AVI, WAV, QCP, etc
+	if (check([0x52, 0x49, 0x46, 0x46])) {
+		if (check([0x41, 0x56, 0x49], {offset: 8})) {
+			return {
+				ext: 'avi',
+				mime: 'video/vnd.avi'
+			};
+		}
+
+		if (check([0x57, 0x41, 0x56, 0x45], {offset: 8})) {
+			return {
+				ext: 'wav',
+				mime: 'audio/vnd.wave'
+			};
+		}
+
+		// QLCM, QCP file
+		if (check([0x51, 0x4C, 0x43, 0x4D], {offset: 8})) {
+			return {
+				ext: 'qcp',
+				mime: 'audio/qcelp'
+			};
+		}
+	}
+
+	if (checkString('SQLi')) {
+		return {
+			ext: 'sqlite',
+			mime: 'application/x-sqlite3'
+		};
+	}
+
+	if (check([0x4E, 0x45, 0x53, 0x1A])) {
+		return {
+			ext: 'nes',
+			mime: 'application/x-nintendo-nes-rom'
+		};
+	}
+
+	if (checkString('Cr24')) {
+		return {
+			ext: 'crx',
+			mime: 'application/x-google-chrome-extension'
+		};
+	}
+
+	if (
+		checkString('MSCF') ||
+		checkString('ISc(')
+	) {
+		return {
+			ext: 'cab',
+			mime: 'application/vnd.ms-cab-compressed'
+		};
+	}
+
+	if (check([0xED, 0xAB, 0xEE, 0xDB])) {
+		return {
+			ext: 'rpm',
+			mime: 'application/x-rpm'
+		};
+	}
+
+	if (check([0xC5, 0xD0, 0xD3, 0xC6])) {
+		return {
+			ext: 'eps',
+			mime: 'application/eps'
+		};
+	}
+
+	// -- 5-byte signatures --
+
+	if (check([0x4F, 0x54, 0x54, 0x4F, 0x00])) {
+		return {
+			ext: 'otf',
+			mime: 'font/otf'
+		};
+	}
+
+	if (checkString('#!AMR')) {
+		return {
+			ext: 'amr',
+			mime: 'audio/amr'
+		};
+	}
+
+	if (checkString('{\\rtf')) {
+		return {
+			ext: 'rtf',
+			mime: 'application/rtf'
+		};
+	}
+
+	if (check([0x46, 0x4C, 0x56, 0x01])) {
+		return {
+			ext: 'flv',
+			mime: 'video/x-flv'
+		};
+	}
+
+	if (checkString('IMPM')) {
+		return {
+			ext: 'it',
+			mime: 'audio/x-it'
+		};
+	}
+
+	if (
+		checkString('-lh0-', {offset: 2}) ||
+		checkString('-lh1-', {offset: 2}) ||
+		checkString('-lh2-', {offset: 2}) ||
+		checkString('-lh3-', {offset: 2}) ||
+		checkString('-lh4-', {offset: 2}) ||
+		checkString('-lh5-', {offset: 2}) ||
+		checkString('-lh6-', {offset: 2}) ||
+		checkString('-lh7-', {offset: 2}) ||
+		checkString('-lzs-', {offset: 2}) ||
+		checkString('-lz4-', {offset: 2}) ||
+		checkString('-lz5-', {offset: 2}) ||
+		checkString('-lhd-', {offset: 2})
+	) {
+		return {
+			ext: 'lzh',
+			mime: 'application/x-lzh-compressed'
+		};
+	}
+
+	// MPEG program stream (PS or MPEG-PS)
+	if (check([0x00, 0x00, 0x01, 0xBA])) {
+		//  MPEG-PS, MPEG-1 Part 1
+		if (check([0x21], {offset: 4, mask: [0xF1]})) {
+			return {
+				ext: 'mpg', // May also be .ps, .mpeg
+				mime: 'video/MP1S'
+			};
+		}
+
+		// MPEG-PS, MPEG-2 Part 1
+		if (check([0x44], {offset: 4, mask: [0xC4]})) {
+			return {
+				ext: 'mpg', // May also be .mpg, .m2p, .vob or .sub
+				mime: 'video/MP2P'
+			};
+		}
+	}
+
+	// -- 6-byte signatures --
+
+	if (check([0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00])) {
+		return {
+			ext: 'xz',
+			mime: 'application/x-xz'
+		};
+	}
+
+	if (checkString('<?xml ')) {
+		return {
+			ext: 'xml',
+			mime: 'application/xml'
+		};
+	}
+
+	if (checkString('BEGIN:')) {
+		return {
+			ext: 'ics',
+			mime: 'text/calendar'
+		};
+	}
+
+	if (check([0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C])) {
+		return {
+			ext: '7z',
+			mime: 'application/x-7z-compressed'
+		};
+	}
+
+	if (
+		check([0x52, 0x61, 0x72, 0x21, 0x1A, 0x7]) &&
+		(buffer[6] === 0x0 || buffer[6] === 0x1)
+	) {
+		return {
+			ext: 'rar',
+			mime: 'application/x-rar-compressed'
+		};
+	}
+
+	// -- 7-byte signatures --
+
+	if (checkString('BLENDER')) {
+		return {
+			ext: 'blend',
+			mime: 'application/x-blender'
+		};
+	}
+
+	if (checkString('!<arch>')) {
+		await tokenizer.ignore(8);
+		const str = await tokenizer.readToken(new Token.StringType(13, 'ascii'));
+		if (str === 'debian-binary') {
+			return {
+				ext: 'deb',
+				mime: 'application/x-deb'
+			};
+		}
+
+		return {
+			ext: 'ar',
+			mime: 'application/x-unix-archive'
+		};
+	}
+
+	// -- 8-byte signatures --
+
+	if (check([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])) {
+		// APNG format (https://wiki.mozilla.org/APNG_Specification)
+		// 1. Find the first IDAT (image data) chunk (49 44 41 54)
+		// 2. Check if there is an "acTL" chunk before the IDAT one (61 63 54 4C)
+
+		// Offset calculated as follows:
+		// - 8 bytes: PNG signature
+		// - 4 (length) + 4 (chunk type) + 13 (chunk data) + 4 (CRC): IHDR chunk
+
+		await tokenizer.ignore(8); // ignore PNG signature
+
+		async function readChunkHeader() {
+			return {
+				length: await tokenizer.readToken(Token.INT32_BE),
+				type: await tokenizer.readToken(new Token.StringType(4, 'binary'))
+			};
+		}
+
+		do {
+			const chunk = await readChunkHeader();
+			switch (chunk.type) {
+				case 'IDAT':
+					return {
+						ext: 'png',
+						mime: 'image/png'
+					};
+				case 'acTL':
+					return {
+						ext: 'apng',
+						mime: 'image/apng'
+					};
+				default:
+					await tokenizer.ignore(chunk.length + 4); // Ignore chunk-data + CRC
+			}
+		} while (tokenizer.position < tokenizer.fileInfo.size);
+
+		return {
+			ext: 'png',
+			mime: 'image/png'
+		};
+	}
+
+	if (check([0x41, 0x52, 0x52, 0x4F, 0x57, 0x31, 0x00, 0x00])) {
+		return {
+			ext: 'arrow',
+			mime: 'application/x-apache-arrow'
+		};
+	}
+
+	if (check([0x67, 0x6C, 0x54, 0x46, 0x02, 0x00, 0x00, 0x00])) {
+		return {
+			ext: 'glb',
+			mime: 'model/gltf-binary'
+		};
+	}
+
+	// `mov` format variants
+	if (
+		check([0x66, 0x72, 0x65, 0x65], {offset: 4}) || // `free`
+		check([0x6D, 0x64, 0x61, 0x74], {offset: 4}) || // `mdat` MJPEG
+		check([0x6D, 0x6F, 0x6F, 0x76], {offset: 4}) || // `moov`
+		check([0x77, 0x69, 0x64, 0x65], {offset: 4}) // `wide`
+	) {
+		return {
+			ext: 'mov',
+			mime: 'video/quicktime'
+		};
+	}
+
+	// -- 9-byte signatures --
+
+	if (check([0x49, 0x49, 0x52, 0x4F, 0x08, 0x00, 0x00, 0x00, 0x18])) {
+		return {
+			ext: 'orf',
+			mime: 'image/x-olympus-orf'
+		};
+	}
+
+	// -- 12-byte signatures --
+
+	if (check([0x49, 0x49, 0x55, 0x00, 0x18, 0x00, 0x00, 0x00, 0x88, 0xE7, 0x74, 0xD8])) {
+		return {
+			ext: 'rw2',
+			mime: 'image/x-panasonic-rw2'
+		};
+	}
+
+	// ASF_Header_Object first 80 bytes
+	if (check([0x30, 0x26, 0xB2, 0x75, 0x8E, 0x66, 0xCF, 0x11, 0xA6, 0xD9])) {
+		async function readHeader() {
+			const guid = Buffer.alloc(16);
+			await tokenizer.readBuffer(guid);
+			return {
+				id: guid,
+				size: await tokenizer.readToken(Token.UINT64_LE)
+			};
+		}
+
+		await tokenizer.ignore(30);
+		// Search for header should be in first 1KB of file.
+		while (tokenizer.position + 24 < tokenizer.fileInfo.size) {
+			const header = await readHeader();
+			let payload = header.size - 24;
+			if (_check(header.id, [0x91, 0x07, 0xDC, 0xB7, 0xB7, 0xA9, 0xCF, 0x11, 0x8E, 0xE6, 0x00, 0xC0, 0x0C, 0x20, 0x53, 0x65])) {
+				// Sync on Stream-Properties-Object (B7DC0791-A9B7-11CF-8EE6-00C00C205365)
+				const typeId = Buffer.alloc(16);
+				payload -= await tokenizer.readBuffer(typeId);
+
+				if (_check(typeId, [0x40, 0x9E, 0x69, 0xF8, 0x4D, 0x5B, 0xCF, 0x11, 0xA8, 0xFD, 0x00, 0x80, 0x5F, 0x5C, 0x44, 0x2B])) {
+					// Found audio:
+					return {
+						ext: 'wma',
+						mime: 'audio/x-ms-wma'
+					};
+				}
+
+				if (_check(typeId, [0xC0, 0xEF, 0x19, 0xBC, 0x4D, 0x5B, 0xCF, 0x11, 0xA8, 0xFD, 0x00, 0x80, 0x5F, 0x5C, 0x44, 0x2B])) {
+					// Found video:
+					return {
+						ext: 'wmv',
+						mime: 'video/x-ms-asf'
+					};
+				}
+
+				break;
+			}
+
+			await tokenizer.ignore(payload);
+		}
+
+		// Default to ASF generic extension
+		return {
+			ext: 'asf',
+			mime: 'application/vnd.ms-asf'
+		};
+	}
+
+	if (check([0xAB, 0x4B, 0x54, 0x58, 0x20, 0x31, 0x31, 0xBB, 0x0D, 0x0A, 0x1A, 0x0A])) {
+		return {
+			ext: 'ktx',
+			mime: 'image/ktx'
+		};
+	}
+
+	if ((check([0x7E, 0x10, 0x04]) || check([0x7E, 0x18, 0x04])) && check([0x30, 0x4D, 0x49, 0x45], {offset: 4})) {
+		return {
+			ext: 'mie',
+			mime: 'application/x-mie'
+		};
+	}
+
+	if (check([0x27, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], {offset: 2})) {
+		return {
+			ext: 'shp',
+			mime: 'application/x-esri-shape'
+		};
+	}
+
+	if (check([0x00, 0x00, 0x00, 0x0C, 0x6A, 0x50, 0x20, 0x20, 0x0D, 0x0A, 0x87, 0x0A])) {
+		// JPEG-2000 family
+
+		await tokenizer.ignore(20);
+		const type = await tokenizer.readToken(new Token.StringType(4, 'ascii'));
+		switch (type) {
+			case 'jp2 ':
+				return {
+					ext: 'jp2',
+					mime: 'image/jp2'
+				};
+			case 'jpx ':
+				return {
+					ext: 'jpx',
+					mime: 'image/jpx'
+				};
+			case 'jpm ':
+				return {
+					ext: 'jpm',
+					mime: 'image/jpm'
+				};
+			case 'mjp2':
+				return {
+					ext: 'mj2',
+					mime: 'image/mj2'
+				};
+			default:
+				return;
+		}
+	}
+
+	// -- Unsafe signatures --
+
+	if (
+		check([0x0, 0x0, 0x1, 0xBA]) ||
+		check([0x0, 0x0, 0x1, 0xB3])
+	) {
+		return {
+			ext: 'mpg',
+			mime: 'video/mpeg'
+		};
+	}
+
+	if (check([0x00, 0x01, 0x00, 0x00, 0x00])) {
+		return {
+			ext: 'ttf',
+			mime: 'font/ttf'
+		};
+	}
+
+	if (check([0x00, 0x00, 0x01, 0x00])) {
+		return {
+			ext: 'ico',
+			mime: 'image/x-icon'
+		};
+	}
+
+	if (check([0x00, 0x00, 0x02, 0x00])) {
+		return {
+			ext: 'cur',
+			mime: 'image/x-icon'
+		};
+	}
+
+	if (check([0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1])) {
+		// Detected Microsoft Compound File Binary File (MS-CFB) Format.
+		return {
+			ext: 'cfb',
+			mime: 'application/x-cfb'
+		};
+	}
+
+	// Increase sample size from 12 to 256.
+	await tokenizer.peekBuffer(buffer, {length: Math.min(256, tokenizer.fileInfo.size), mayBeLess: true});
+
+	// `raf` is here just to keep all the raw image detectors together.
+	if (checkString('FUJIFILMCCD-RAW')) {
+		return {
+			ext: 'raf',
+			mime: 'image/x-fujifilm-raf'
+		};
+	}
+
+	if (checkString('Extended Module:')) {
+		return {
+			ext: 'xm',
+			mime: 'audio/x-xm'
+		};
+	}
+
+	if (checkString('Creative Voice File')) {
+		return {
+			ext: 'voc',
+			mime: 'audio/x-voc'
+		};
+	}
+
+	if (check([0x04, 0x00, 0x00, 0x00]) && buffer.length >= 16) { // Rough & quick check Pickle/ASAR
+		const jsonSize = buffer.readUInt32LE(12);
+		if (jsonSize > 12 && jsonSize < 240 && buffer.length >= jsonSize + 16) {
+			try {
+				const header = buffer.slice(16, jsonSize + 16).toString();
+				const json = JSON.parse(header);
+				// Check if Pickle is ASAR
+				if (json.files) { // Final check, assuring Pickle/ASAR format
+					return {
+						ext: 'asar',
+						mime: 'application/x-asar'
+					};
+				}
+			} catch (_) {
+			}
+		}
+	}
+
+	if (check([0x06, 0x0E, 0x2B, 0x34, 0x02, 0x05, 0x01, 0x01, 0x0D, 0x01, 0x02, 0x01, 0x01, 0x02])) {
+		return {
+			ext: 'mxf',
+			mime: 'application/mxf'
+		};
+	}
+
+	if (checkString('SCRM', {offset: 44})) {
+		return {
+			ext: 's3m',
+			mime: 'audio/x-s3m'
+		};
+	}
+
+	if (check([0x47], {offset: 4}) && (check([0x47], {offset: 192}) || check([0x47], {offset: 196}))) {
+		return {
+			ext: 'mts',
+			mime: 'video/mp2t'
+		};
+	}
+
+	if (check([0x42, 0x4F, 0x4F, 0x4B, 0x4D, 0x4F, 0x42, 0x49], {offset: 60})) {
+		return {
+			ext: 'mobi',
+			mime: 'application/x-mobipocket-ebook'
+		};
+	}
+
+	if (check([0x44, 0x49, 0x43, 0x4D], {offset: 128})) {
+		return {
+			ext: 'dcm',
+			mime: 'application/dicom'
+		};
+	}
+
+	if (check([0x4C, 0x00, 0x00, 0x00, 0x01, 0x14, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46])) {
+		return {
+			ext: 'lnk',
+			mime: 'application/x.ms.shortcut' // Invented by us
+		};
+	}
+
+	if (check([0x62, 0x6F, 0x6F, 0x6B, 0x00, 0x00, 0x00, 0x00, 0x6D, 0x61, 0x72, 0x6B, 0x00, 0x00, 0x00, 0x00])) {
+		return {
+			ext: 'alias',
+			mime: 'application/x.apple.alias' // Invented by us
+		};
+	}
+
+	if (
+		check([0x4C, 0x50], {offset: 34}) &&
+		(
+			check([0x00, 0x00, 0x01], {offset: 8}) ||
+			check([0x01, 0x00, 0x02], {offset: 8}) ||
+			check([0x02, 0x00, 0x02], {offset: 8})
+		)
+	) {
+		return {
+			ext: 'eot',
+			mime: 'application/vnd.ms-fontobject'
+		};
+	}
+
+	if (check([0x06, 0x06, 0xED, 0xF5, 0xD8, 0x1D, 0x46, 0xE5, 0xBD, 0x31, 0xEF, 0xE7, 0xFE, 0x74, 0xB7, 0x1D])) {
+		return {
+			ext: 'indd',
+			mime: 'application/x-indesign'
+		};
+	}
+
+	// Increase sample size from 256 to 512
+	await tokenizer.peekBuffer(buffer, {length: Math.min(512, tokenizer.fileInfo.size), mayBeLess: true});
+
+	// Requires a buffer size of 512 bytes
+	if (tarHeaderChecksumMatches(buffer)) {
+		return {
+			ext: 'tar',
+			mime: 'application/x-tar'
+		};
+	}
+
+	if (check([0xFF, 0xFE, 0xFF, 0x0E, 0x53, 0x00, 0x6B, 0x00, 0x65, 0x00, 0x74, 0x00, 0x63, 0x00, 0x68, 0x00, 0x55, 0x00, 0x70, 0x00, 0x20, 0x00, 0x4D, 0x00, 0x6F, 0x00, 0x64, 0x00, 0x65, 0x00, 0x6C, 0x00])) {
+		return {
+			ext: 'skp',
+			mime: 'application/vnd.sketchup.skp'
+		};
+	}
+
+	if (checkString('-----BEGIN PGP MESSAGE-----')) {
+		return {
+			ext: 'pgp',
+			mime: 'application/pgp-encrypted'
+		};
+	}
+
+	// Check for MPEG header at different starting offsets
+	for (let start = 0; start < 2 && start < (buffer.length - 16); start++) {
+		// Check MPEG 1 or 2 Layer 3 header, or 'layer 0' for ADTS (MPEG sync-word 0xFFE)
+		if (buffer.length >= start + 2 && check([0xFF, 0xE0], {offset: start, mask: [0xFF, 0xE0]})) {
+			if (check([0x10], {offset: start + 1, mask: [0x16]})) {
+				// Check for (ADTS) MPEG-2
+				if (check([0x08], {offset: start + 1, mask: [0x08]})) {
+					return {
+						ext: 'aac',
+						mime: 'audio/aac'
+					};
+				}
+
+				// Must be (ADTS) MPEG-4
+				return {
+					ext: 'aac',
+					mime: 'audio/aac'
+				};
+			}
+
+			// MPEG 1 or 2 Layer 3 header
+			// Check for MPEG layer 3
+			if (check([0x02], {offset: start + 1, mask: [0x06]})) {
+				return {
+					ext: 'mp3',
+					mime: 'audio/mpeg'
+				};
+			}
+
+			// Check for MPEG layer 2
+			if (check([0x04], {offset: start + 1, mask: [0x06]})) {
+				return {
+					ext: 'mp2',
+					mime: 'audio/mpeg'
+				};
+			}
+
+			// Check for MPEG layer 1
+			if (check([0x06], {offset: start + 1, mask: [0x06]})) {
+				return {
+					ext: 'mp1',
+					mime: 'audio/mpeg'
+				};
+			}
+		}
+	}
+}
+
+const stream = readableStream => new Promise((resolve, reject) => {
+	// Using `eval` to work around issues when bundling with Webpack
+	const stream = eval('require')('stream'); // eslint-disable-line no-eval
+
+	readableStream.on('error', reject);
+	readableStream.once('readable', async () => {
+		// Set up output stream
+		const pass = new stream.PassThrough();
+		let outputStream;
+		if (stream.pipeline) {
+			outputStream = stream.pipeline(readableStream, pass, () => {
+			});
+		} else {
+			outputStream = readableStream.pipe(pass);
+		}
+
+		// Read the input stream and detect the filetype
+		const chunk = readableStream.read(minimumBytes) || readableStream.read() || Buffer.alloc(0);
+		try {
+			const fileType = await fromBuffer(chunk);
+			pass.fileType = fileType;
+		} catch (error) {
+			reject(error);
+		}
+
+		resolve(outputStream);
+	});
+});
+
+const fileType = {
+	fromStream,
+	fromTokenizer,
+	fromBuffer,
+	stream
+};
+
+Object.defineProperty(fileType, 'extensions', {
+	get() {
+		return new Set(supported.extensions);
+	}
+});
+
+Object.defineProperty(fileType, 'mimeTypes', {
+	get() {
+		return new Set(supported.mimeTypes);
+	}
+});
+
+module.exports = fileType;
+
+
+/***/ }),
+
+/***/ 4930:
+/***/ ((module, __unused_webpack_exports, __webpack_require__) => {
+
+"use strict";
+
+const strtok3 = __webpack_require__(8569);
+const core = __webpack_require__(4126);
+
+async function fromFile(path) {
+	const tokenizer = await strtok3.fromFile(path);
+	try {
+		return await core.fromTokenizer(tokenizer);
+	} finally {
+		await tokenizer.close();
+	}
+}
+
+const fileType = {
+	fromFile
+};
+
+Object.assign(fileType, core);
+
+Object.defineProperty(fileType, 'extensions', {
+	get() {
+		return core.extensions;
+	}
+});
+
+Object.defineProperty(fileType, 'mimeTypes', {
+	get() {
+		return core.mimeTypes;
+	}
+});
+
+module.exports = fileType;
+
+
+/***/ }),
+
+/***/ 7860:
+/***/ ((module) => {
+
+"use strict";
+
+
+module.exports = {
+	extensions: [
+		'jpg',
+		'png',
+		'apng',
+		'gif',
+		'webp',
+		'flif',
+		'cr2',
+		'cr3',
+		'orf',
+		'arw',
+		'dng',
+		'nef',
+		'rw2',
+		'raf',
+		'tif',
+		'bmp',
+		'icns',
+		'jxr',
+		'psd',
+		'indd',
+		'zip',
+		'tar',
+		'rar',
+		'gz',
+		'bz2',
+		'7z',
+		'dmg',
+		'mp4',
+		'mid',
+		'mkv',
+		'webm',
+		'mov',
+		'avi',
+		'mpg',
+		'mp2',
+		'mp3',
+		'm4a',
+		'oga',
+		'ogg',
+		'ogv',
+		'opus',
+		'flac',
+		'wav',
+		'spx',
+		'amr',
+		'pdf',
+		'epub',
+		'exe',
+		'swf',
+		'rtf',
+		'wasm',
+		'woff',
+		'woff2',
+		'eot',
+		'ttf',
+		'otf',
+		'ico',
+		'flv',
+		'ps',
+		'xz',
+		'sqlite',
+		'nes',
+		'crx',
+		'xpi',
+		'cab',
+		'deb',
+		'ar',
+		'rpm',
+		'Z',
+		'lz',
+		'cfb',
+		'mxf',
+		'mts',
+		'blend',
+		'bpg',
+		'docx',
+		'pptx',
+		'xlsx',
+		'3gp',
+		'3g2',
+		'jp2',
+		'jpm',
+		'jpx',
+		'mj2',
+		'aif',
+		'qcp',
+		'odt',
+		'ods',
+		'odp',
+		'xml',
+		'mobi',
+		'heic',
+		'cur',
+		'ktx',
+		'ape',
+		'wv',
+		'wmv',
+		'wma',
+		'dcm',
+		'ics',
+		'glb',
+		'pcap',
+		'dsf',
+		'lnk',
+		'alias',
+		'voc',
+		'ac3',
+		'm4v',
+		'm4p',
+		'm4b',
+		'f4v',
+		'f4p',
+		'f4b',
+		'f4a',
+		'mie',
+		'asf',
+		'ogm',
+		'ogx',
+		'mpc',
+		'arrow',
+		'shp',
+		'aac',
+		'mp1',
+		'it',
+		's3m',
+		'xm',
+		'ai',
+		'skp',
+		'avif',
+		'eps',
+		'lzh',
+		'pgp',
+		'asar'
+	],
+	mimeTypes: [
+		'image/jpeg',
+		'image/png',
+		'image/gif',
+		'image/webp',
+		'image/flif',
+		'image/x-canon-cr2',
+		'image/x-canon-cr3',
+		'image/tiff',
+		'image/bmp',
+		'image/vnd.ms-photo',
+		'image/vnd.adobe.photoshop',
+		'application/x-indesign',
+		'application/epub+zip',
+		'application/x-xpinstall',
+		'application/vnd.oasis.opendocument.text',
+		'application/vnd.oasis.opendocument.spreadsheet',
+		'application/vnd.oasis.opendocument.presentation',
+		'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+		'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+		'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+		'application/zip',
+		'application/x-tar',
+		'application/x-rar-compressed',
+		'application/gzip',
+		'application/x-bzip2',
+		'application/x-7z-compressed',
+		'application/x-apple-diskimage',
+		'application/x-apache-arrow',
+		'video/mp4',
+		'audio/midi',
+		'video/x-matroska',
+		'video/webm',
+		'video/quicktime',
+		'video/vnd.avi',
+		'audio/vnd.wave',
+		'audio/qcelp',
+		'audio/x-ms-wma',
+		'video/x-ms-asf',
+		'application/vnd.ms-asf',
+		'video/mpeg',
+		'video/3gpp',
+		'audio/mpeg',
+		'audio/mp4', // RFC 4337
+		'audio/opus',
+		'video/ogg',
+		'audio/ogg',
+		'application/ogg',
+		'audio/x-flac',
+		'audio/ape',
+		'audio/wavpack',
+		'audio/amr',
+		'application/pdf',
+		'application/x-msdownload',
+		'application/x-shockwave-flash',
+		'application/rtf',
+		'application/wasm',
+		'font/woff',
+		'font/woff2',
+		'application/vnd.ms-fontobject',
+		'font/ttf',
+		'font/otf',
+		'image/x-icon',
+		'video/x-flv',
+		'application/postscript',
+		'application/eps',
+		'application/x-xz',
+		'application/x-sqlite3',
+		'application/x-nintendo-nes-rom',
+		'application/x-google-chrome-extension',
+		'application/vnd.ms-cab-compressed',
+		'application/x-deb',
+		'application/x-unix-archive',
+		'application/x-rpm',
+		'application/x-compress',
+		'application/x-lzip',
+		'application/x-cfb',
+		'application/x-mie',
+		'application/mxf',
+		'video/mp2t',
+		'application/x-blender',
+		'image/bpg',
+		'image/jp2',
+		'image/jpx',
+		'image/jpm',
+		'image/mj2',
+		'audio/aiff',
+		'application/xml',
+		'application/x-mobipocket-ebook',
+		'image/heif',
+		'image/heif-sequence',
+		'image/heic',
+		'image/heic-sequence',
+		'image/icns',
+		'image/ktx',
+		'application/dicom',
+		'audio/x-musepack',
+		'text/calendar',
+		'model/gltf-binary',
+		'application/vnd.tcpdump.pcap',
+		'audio/x-dsf', // Non-standard
+		'application/x.ms.shortcut', // Invented by us
+		'application/x.apple.alias', // Invented by us
+		'audio/x-voc',
+		'audio/vnd.dolby.dd-raw',
+		'audio/x-m4a',
+		'image/apng',
+		'image/x-olympus-orf',
+		'image/x-sony-arw',
+		'image/x-adobe-dng',
+		'image/x-nikon-nef',
+		'image/x-panasonic-rw2',
+		'image/x-fujifilm-raf',
+		'video/x-m4v',
+		'video/3gpp2',
+		'application/x-esri-shape',
+		'audio/aac',
+		'audio/x-it',
+		'audio/x-s3m',
+		'audio/x-xm',
+		'video/MP1S',
+		'video/MP2P',
+		'application/vnd.sketchup.skp',
+		'image/avif',
+		'application/x-lzh-compressed',
+		'application/pgp-encrypted',
+		'application/x-asar'
+	]
+};
+
+
+/***/ }),
+
+/***/ 4875:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+
+exports.stringToBytes = string => [...string].map(character => character.charCodeAt(0));
+
+/**
+Checks whether the TAR checksum is valid.
+
+@param {Buffer} buffer - The TAR header `[offset ... offset + 512]`.
+@param {number} offset - TAR header offset.
+@returns {boolean} `true` if the TAR checksum is valid, otherwise `false`.
+*/
+exports.tarHeaderChecksumMatches = (buffer, offset = 0) => {
+	const readSum = parseInt(buffer.toString('utf8', 148, 154).replace(/\0.*$/, '').trim(), 8); // Read sum in header
+	if (isNaN(readSum)) {
+		return false;
+	}
+
+	let sum = 8 * 0x20; // Initialize signed bit sum
+
+	for (let i = offset; i < offset + 148; i++) {
+		sum += buffer[i];
+	}
+
+	for (let i = offset + 156; i < offset + 512; i++) {
+		sum += buffer[i];
+	}
+
+	return readSum === sum;
+};
+
+/**
+ID3 UINT32 sync-safe tokenizer token.
+28 bits (representing up to 256MB) integer, the msb is 0 to avoid "false syncsignals".
+*/
+exports.uint32SyncSafeToken = {
+	get: (buffer, offset) => {
+		return (buffer[offset + 3] & 0x7F) | ((buffer[offset + 2]) << 7) | ((buffer[offset + 1]) << 14) | ((buffer[offset]) << 21);
+	},
+	len: 4
+};
+
+
+/***/ }),
+
+/***/ 3092:
+/***/ ((__unused_webpack_module, exports) => {
+
+exports.read = function (buffer, offset, isLE, mLen, nBytes) {
+  var e, m
+  var eLen = (nBytes * 8) - mLen - 1
+  var eMax = (1 << eLen) - 1
+  var eBias = eMax >> 1
+  var nBits = -7
+  var i = isLE ? (nBytes - 1) : 0
+  var d = isLE ? -1 : 1
+  var s = buffer[offset + i]
+
+  i += d
+
+  e = s & ((1 << (-nBits)) - 1)
+  s >>= (-nBits)
+  nBits += eLen
+  for (; nBits > 0; e = (e * 256) + buffer[offset + i], i += d, nBits -= 8) {}
+
+  m = e & ((1 << (-nBits)) - 1)
+  e >>= (-nBits)
+  nBits += mLen
+  for (; nBits > 0; m = (m * 256) + buffer[offset + i], i += d, nBits -= 8) {}
+
+  if (e === 0) {
+    e = 1 - eBias
+  } else if (e === eMax) {
+    return m ? NaN : ((s ? -1 : 1) * Infinity)
+  } else {
+    m = m + Math.pow(2, mLen)
+    e = e - eBias
+  }
+  return (s ? -1 : 1) * m * Math.pow(2, e - mLen)
+}
+
+exports.write = function (buffer, value, offset, isLE, mLen, nBytes) {
+  var e, m, c
+  var eLen = (nBytes * 8) - mLen - 1
+  var eMax = (1 << eLen) - 1
+  var eBias = eMax >> 1
+  var rt = (mLen === 23 ? Math.pow(2, -24) - Math.pow(2, -77) : 0)
+  var i = isLE ? 0 : (nBytes - 1)
+  var d = isLE ? 1 : -1
+  var s = value < 0 || (value === 0 && 1 / value < 0) ? 1 : 0
+
+  value = Math.abs(value)
+
+  if (isNaN(value) || value === Infinity) {
+    m = isNaN(value) ? 1 : 0
+    e = eMax
+  } else {
+    e = Math.floor(Math.log(value) / Math.LN2)
+    if (value * (c = Math.pow(2, -e)) < 1) {
+      e--
+      c *= 2
+    }
+    if (e + eBias >= 1) {
+      value += rt / c
+    } else {
+      value += rt * Math.pow(2, 1 - eBias)
+    }
+    if (value * c >= 2) {
+      e++
+      c /= 2
+    }
+
+    if (e + eBias >= eMax) {
+      m = 0
+      e = eMax
+    } else if (e + eBias >= 1) {
+      m = ((value * c) - 1) * Math.pow(2, mLen)
+      e = e + eBias
+    } else {
+      m = value * Math.pow(2, eBias - 1) * Math.pow(2, mLen)
+      e = 0
+    }
+  }
+
+  for (; mLen >= 8; buffer[offset + i] = m & 0xff, i += d, m /= 256, mLen -= 8) {}
+
+  e = (e << mLen) | m
+  eLen += mLen
+  for (; eLen > 0; buffer[offset + i] = e & 0xff, i += d, e /= 256, eLen -= 8) {}
+
+  buffer[offset + i - d] |= s * 128
+}
+
+
+/***/ }),
+
 /***/ 8840:
 /***/ ((module) => {
 
@@ -11723,6 +13636,170 @@ function onceStrict (fn) {
   return f
 }
 
+
+/***/ }),
+
+/***/ 7770:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.defaultMessages = 'End-Of-Stream';
+/**
+ * Thrown on read operation of the end of file or stream has been reached
+ */
+class EndOfStreamError extends Error {
+    constructor() {
+        super(exports.defaultMessages);
+    }
+}
+exports.EndOfStreamError = EndOfStreamError;
+//# sourceMappingURL=EndOfFileStream.js.map
+
+/***/ }),
+
+/***/ 3752:
+/***/ ((__unused_webpack_module, exports, __webpack_require__) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+const assert = __webpack_require__(2357);
+const EndOfFileStream_1 = __webpack_require__(7770);
+var EndOfFileStream_2 = __webpack_require__(7770);
+exports.EndOfStreamError = EndOfFileStream_2.EndOfStreamError;
+class Deferred {
+    constructor() {
+        this.promise = new Promise((resolve, reject) => {
+            this.reject = reject;
+            this.resolve = resolve;
+        });
+    }
+}
+const maxStreamReadSize = 1 * 1024 * 1024; // Maximum request length on read-stream operation
+class StreamReader {
+    constructor(s) {
+        this.s = s;
+        this.endOfStream = false;
+        /**
+         * Store peeked data
+         * @type {Array}
+         */
+        this.peekQueue = [];
+        if (!s.read || !s.once) {
+            throw new Error('Expected an instance of stream.Readable');
+        }
+        this.s.once('end', () => this.reject(new EndOfFileStream_1.EndOfStreamError()));
+        this.s.once('error', err => this.reject(err));
+        this.s.once('close', () => this.reject(new Error('Stream closed')));
+    }
+    /**
+     * Read ahead (peek) from stream. Subsequent read or peeks will return the same data
+     * @param buffer - Buffer to store data read from stream in
+     * @param offset - Offset buffer
+     * @param length - Number of bytes to read
+     * @returns Number of bytes peeked
+     */
+    async peek(buffer, offset, length) {
+        const bytesRead = await this.read(buffer, offset, length);
+        this.peekQueue.push(buffer.slice(offset, offset + bytesRead)); // Put read data back to peek buffer
+        return bytesRead;
+    }
+    /**
+     * Read chunk from stream
+     * @param buffer - Target buffer to store data read from stream in
+     * @param offset - Offset of target buffer
+     * @param length - Number of bytes to read
+     * @returns Number of bytes read
+     */
+    async read(buffer, offset, length) {
+        if (length === 0) {
+            return 0;
+        }
+        if (this.peekQueue.length === 0 && this.endOfStream) {
+            throw new EndOfFileStream_1.EndOfStreamError();
+        }
+        let remaining = length;
+        let bytesRead = 0;
+        // consume peeked data first
+        while (this.peekQueue.length > 0 && remaining > 0) {
+            const peekData = this.peekQueue.pop(); // Front of queue
+            const lenCopy = Math.min(peekData.length, remaining);
+            peekData.copy(buffer, offset + bytesRead, 0, lenCopy);
+            bytesRead += lenCopy;
+            remaining -= lenCopy;
+            if (lenCopy < peekData.length) {
+                // remainder back to queue
+                this.peekQueue.push(peekData.slice(lenCopy));
+            }
+        }
+        // continue reading from stream if required
+        while (remaining > 0 && !this.endOfStream) {
+            const reqLen = Math.min(remaining, maxStreamReadSize);
+            const chunkLen = await this._read(buffer, offset + bytesRead, reqLen);
+            bytesRead += chunkLen;
+            if (chunkLen < reqLen)
+                break;
+            remaining -= chunkLen;
+        }
+        return bytesRead;
+    }
+    /**
+     * Read chunk from stream
+     * @param buffer Buffer to store data read from stream in
+     * @param offset Offset buffer
+     * @param length Number of bytes to read
+     * @returns {any}
+     */
+    async _read(buffer, offset, length) {
+        assert.ok(!this.request, 'Concurrent read operation?');
+        const readBuffer = this.s.read(length);
+        if (readBuffer) {
+            readBuffer.copy(buffer, offset);
+            return readBuffer.length;
+        }
+        else {
+            this.request = {
+                buffer,
+                offset,
+                length,
+                deferred: new Deferred()
+            };
+            this.s.once('readable', () => {
+                this.tryRead();
+            });
+            return this.request.deferred.promise.then(n => {
+                this.request = null;
+                return n;
+            }, err => {
+                this.request = null;
+                throw err;
+            });
+        }
+    }
+    tryRead() {
+        const readBuffer = this.s.read(this.request.length);
+        if (readBuffer) {
+            readBuffer.copy(this.request.buffer, this.request.offset);
+            this.request.deferred.resolve(readBuffer.length);
+        }
+        else {
+            this.s.once('readable', () => {
+                this.tryRead();
+            });
+        }
+    }
+    reject(err) {
+        this.endOfStream = true;
+        if (this.request) {
+            this.request.deferred.reject(err);
+            this.request = null;
+        }
+    }
+}
+exports.StreamReader = StreamReader;
+//# sourceMappingURL=index.js.map
 
 /***/ }),
 
@@ -16083,6 +18160,1243 @@ MultiStream.prototype._read = function () {
   this.push(this._object);
   this._object = null;
 };
+
+/***/ }),
+
+/***/ 5051:
+/***/ ((__unused_webpack_module, exports, __webpack_require__) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.AbstractTokenizer = void 0;
+const peek_readable_1 = __webpack_require__(3752);
+/**
+ * Core tokenizer
+ */
+class AbstractTokenizer {
+    constructor(fileInfo) {
+        /**
+         * Tokenizer-stream position
+         */
+        this.position = 0;
+        this.numBuffer = Buffer.alloc(10);
+        this.fileInfo = fileInfo ? fileInfo : {};
+    }
+    /**
+     * Read a token from the tokenizer-stream
+     * @param token - The token to read
+     * @param position - If provided, the desired position in the tokenizer-stream
+     * @returns Promise with token data
+     */
+    async readToken(token, position) {
+        const buffer = Buffer.alloc(token.len);
+        const len = await this.readBuffer(buffer, { position });
+        if (len < token.len)
+            throw new peek_readable_1.EndOfStreamError();
+        return token.get(buffer, 0);
+    }
+    /**
+     * Peek a token from the tokenizer-stream.
+     * @param token - Token to peek from the tokenizer-stream.
+     * @param position - Offset where to begin reading within the file. If position is null, data will be read from the current file position.
+     * @returns Promise with token data
+     */
+    async peekToken(token, position = this.position) {
+        const buffer = Buffer.alloc(token.len);
+        const len = await this.peekBuffer(buffer, { position });
+        if (len < token.len)
+            throw new peek_readable_1.EndOfStreamError();
+        return token.get(buffer, 0);
+    }
+    /**
+     * Read a numeric token from the stream
+     * @param token - Numeric token
+     * @returns Promise with number
+     */
+    async readNumber(token) {
+        const len = await this.readBuffer(this.numBuffer, { length: token.len });
+        if (len < token.len)
+            throw new peek_readable_1.EndOfStreamError();
+        return token.get(this.numBuffer, 0);
+    }
+    /**
+     * Read a numeric token from the stream
+     * @param token - Numeric token
+     * @returns Promise with number
+     */
+    async peekNumber(token) {
+        const len = await this.peekBuffer(this.numBuffer, { length: token.len });
+        if (len < token.len)
+            throw new peek_readable_1.EndOfStreamError();
+        return token.get(this.numBuffer, 0);
+    }
+    async close() {
+        // empty
+    }
+}
+exports.AbstractTokenizer = AbstractTokenizer;
+//# sourceMappingURL=AbstractTokenizer.js.map
+
+/***/ }),
+
+/***/ 8054:
+/***/ ((__unused_webpack_module, exports, __webpack_require__) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.BufferTokenizer = void 0;
+const peek_readable_1 = __webpack_require__(3752);
+class BufferTokenizer {
+    /**
+     * Construct BufferTokenizer
+     * @param buffer - Buffer to tokenize
+     * @param fileInfo - Pass additional file information to the tokenizer
+     */
+    constructor(buffer, fileInfo) {
+        this.buffer = buffer;
+        this.position = 0;
+        this.fileInfo = fileInfo ? fileInfo : {};
+        this.fileInfo.size = this.fileInfo.size ? this.fileInfo.size : buffer.length;
+    }
+    /**
+     * Read buffer from tokenizer
+     * @param buffer
+     * @param options - Read behaviour options
+     * @returns {Promise<number>}
+     */
+    async readBuffer(buffer, options) {
+        if (options && options.position) {
+            if (options.position < this.position) {
+                throw new Error('`options.position` must be equal or greater than `tokenizer.position`');
+            }
+            this.position = options.position;
+        }
+        return this.peekBuffer(buffer, options).then(bytesRead => {
+            this.position += bytesRead;
+            return bytesRead;
+        });
+    }
+    /**
+     * Peek (read ahead) buffer from tokenizer
+     * @param buffer
+     * @param options - Read behaviour options
+     * @returns {Promise<number>}
+     */
+    async peekBuffer(buffer, options) {
+        let offset = 0;
+        let length = buffer.length;
+        let position = this.position;
+        if (options) {
+            if (options.position) {
+                if (options.position < this.position) {
+                    throw new Error('`options.position` can be less than `tokenizer.position`');
+                }
+                position = options.position;
+            }
+            if (Number.isInteger(options.length)) {
+                length = options.length;
+            }
+            else {
+                length -= options.offset || 0;
+            }
+            if (options.offset) {
+                offset = options.offset;
+            }
+        }
+        if (length === 0) {
+            return Promise.resolve(0);
+        }
+        position = position || this.position;
+        if (!length) {
+            length = buffer.length;
+        }
+        const bytes2read = Math.min(this.buffer.length - position, length);
+        if ((!options || !options.mayBeLess) && bytes2read < length) {
+            throw new peek_readable_1.EndOfStreamError();
+        }
+        else {
+            this.buffer.copy(buffer, offset, position, position + bytes2read);
+            return bytes2read;
+        }
+    }
+    async readToken(token, position) {
+        this.position = position || this.position;
+        try {
+            const tv = this.peekToken(token, this.position);
+            this.position += token.len;
+            return tv;
+        }
+        catch (err) {
+            this.position += this.buffer.length - position;
+            throw err;
+        }
+    }
+    async peekToken(token, position = this.position) {
+        if (this.buffer.length - position < token.len) {
+            throw new peek_readable_1.EndOfStreamError();
+        }
+        return token.get(this.buffer, position);
+    }
+    async readNumber(token) {
+        return this.readToken(token);
+    }
+    async peekNumber(token) {
+        return this.peekToken(token);
+    }
+    /**
+     * @return actual number of bytes ignored
+     */
+    async ignore(length) {
+        const bytesIgnored = Math.min(this.buffer.length - this.position, length);
+        this.position += bytesIgnored;
+        return bytesIgnored;
+    }
+    async close() {
+        // empty
+    }
+}
+exports.BufferTokenizer = BufferTokenizer;
+//# sourceMappingURL=BufferTokenizer.js.map
+
+/***/ }),
+
+/***/ 561:
+/***/ ((__unused_webpack_module, exports, __webpack_require__) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.fromFile = exports.FileTokenizer = void 0;
+const AbstractTokenizer_1 = __webpack_require__(5051);
+const peek_readable_1 = __webpack_require__(3752);
+const fs = __webpack_require__(3915);
+class FileTokenizer extends AbstractTokenizer_1.AbstractTokenizer {
+    constructor(fd, fileInfo) {
+        super(fileInfo);
+        this.fd = fd;
+    }
+    /**
+     * Read buffer from file
+     * @param buffer
+     * @param options - Read behaviour options
+     * @returns Promise number of bytes read
+     */
+    async readBuffer(buffer, options) {
+        let offset = 0;
+        let length = buffer.length;
+        if (options) {
+            if (options.position) {
+                if (options.position < this.position) {
+                    throw new Error('`options.position` must be equal or greater than `tokenizer.position`');
+                }
+                this.position = options.position;
+            }
+            if (Number.isInteger(options.length)) {
+                length = options.length;
+            }
+            else {
+                length -= options.offset || 0;
+            }
+            if (options.offset) {
+                offset = options.offset;
+            }
+        }
+        if (length === 0) {
+            return Promise.resolve(0);
+        }
+        const res = await fs.read(this.fd, buffer, offset, length, this.position);
+        this.position += res.bytesRead;
+        if (res.bytesRead < length && (!options || !options.mayBeLess)) {
+            throw new peek_readable_1.EndOfStreamError();
+        }
+        return res.bytesRead;
+    }
+    /**
+     * Peek buffer from file
+     * @param buffer
+     * @param options - Read behaviour options
+     * @returns Promise number of bytes read
+     */
+    async peekBuffer(buffer, options) {
+        let offset = 0;
+        let length = buffer.length;
+        let position = this.position;
+        if (options) {
+            if (options.position) {
+                if (options.position < this.position) {
+                    throw new Error('`options.position` must be equal or greater than `tokenizer.position`');
+                }
+                position = options.position;
+            }
+            if (Number.isInteger(options.length)) {
+                length = options.length;
+            }
+            else {
+                length -= options.offset || 0;
+            }
+            if (options.offset) {
+                offset = options.offset;
+            }
+        }
+        if (length === 0) {
+            return Promise.resolve(0);
+        }
+        const res = await fs.read(this.fd, buffer, offset, length, position);
+        if ((!options || !options.mayBeLess) && res.bytesRead < length) {
+            throw new peek_readable_1.EndOfStreamError();
+        }
+        return res.bytesRead;
+    }
+    /**
+     * @param length - Number of bytes to ignore
+     * @return resolves the number of bytes ignored, equals length if this available, otherwise the number of bytes available
+     */
+    async ignore(length) {
+        const bytesLeft = this.fileInfo.size - this.position;
+        if (length <= bytesLeft) {
+            this.position += length;
+            return length;
+        }
+        else {
+            this.position += bytesLeft;
+            return bytesLeft;
+        }
+    }
+    async close() {
+        return fs.close(this.fd);
+    }
+}
+exports.FileTokenizer = FileTokenizer;
+async function fromFile(sourceFilePath) {
+    const stat = await fs.stat(sourceFilePath);
+    if (!stat.isFile) {
+        throw new Error(`File not a file: ${sourceFilePath}`);
+    }
+    const fd = await fs.open(sourceFilePath, 'r');
+    return new FileTokenizer(fd, { path: sourceFilePath, size: stat.size });
+}
+exports.fromFile = fromFile;
+//# sourceMappingURL=FileTokenizer.js.map
+
+/***/ }),
+
+/***/ 3915:
+/***/ ((__unused_webpack_module, exports, __webpack_require__) => {
+
+"use strict";
+
+/**
+ * Module convert fs functions to promise based functions
+ */
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.readFile = exports.writeFileSync = exports.writeFile = exports.read = exports.open = exports.close = exports.stat = exports.createReadStream = exports.pathExists = void 0;
+const fs = __webpack_require__(5747);
+exports.pathExists = fs.existsSync;
+exports.createReadStream = fs.createReadStream;
+async function stat(path) {
+    return new Promise((resolve, reject) => {
+        fs.stat(path, (err, stats) => {
+            if (err)
+                reject(err);
+            else
+                resolve(stats);
+        });
+    });
+}
+exports.stat = stat;
+async function close(fd) {
+    return new Promise((resolve, reject) => {
+        fs.close(fd, err => {
+            if (err)
+                reject(err);
+            else
+                resolve();
+        });
+    });
+}
+exports.close = close;
+async function open(path, mode) {
+    return new Promise((resolve, reject) => {
+        fs.open(path, mode, (err, fd) => {
+            if (err)
+                reject(err);
+            else
+                resolve(fd);
+        });
+    });
+}
+exports.open = open;
+async function read(fd, buffer, offset, length, position) {
+    return new Promise((resolve, reject) => {
+        fs.read(fd, buffer, offset, length, position, (err, bytesRead, _buffer) => {
+            if (err)
+                reject(err);
+            else
+                resolve({ bytesRead, buffer: _buffer });
+        });
+    });
+}
+exports.read = read;
+async function writeFile(path, data) {
+    return new Promise((resolve, reject) => {
+        fs.writeFile(path, data, err => {
+            if (err)
+                reject(err);
+            else
+                resolve();
+        });
+    });
+}
+exports.writeFile = writeFile;
+function writeFileSync(path, data) {
+    fs.writeFileSync(path, data);
+}
+exports.writeFileSync = writeFileSync;
+async function readFile(path) {
+    return new Promise((resolve, reject) => {
+        fs.readFile(path, (err, buffer) => {
+            if (err)
+                reject(err);
+            else
+                resolve(buffer);
+        });
+    });
+}
+exports.readFile = readFile;
+//# sourceMappingURL=FsPromise.js.map
+
+/***/ }),
+
+/***/ 8888:
+/***/ ((__unused_webpack_module, exports, __webpack_require__) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.ReadStreamTokenizer = void 0;
+const AbstractTokenizer_1 = __webpack_require__(5051);
+const peek_readable_1 = __webpack_require__(3752);
+// import * as _debug from 'debug';
+// const debug = _debug('strtok3:ReadStreamTokenizer');
+const maxBufferSize = 256000;
+class ReadStreamTokenizer extends AbstractTokenizer_1.AbstractTokenizer {
+    constructor(stream, fileInfo) {
+        super(fileInfo);
+        this.streamReader = new peek_readable_1.StreamReader(stream);
+    }
+    /**
+     * Get file information, an HTTP-client may implement this doing a HEAD request
+     * @return Promise with file information
+     */
+    async getFileInfo() {
+        return this.fileInfo;
+    }
+    /**
+     * Read buffer from tokenizer
+     * @param buffer - Target buffer to fill with data read from the tokenizer-stream
+     * @param options - Read behaviour options
+     * @returns Promise with number of bytes read
+     */
+    async readBuffer(buffer, options) {
+        // const _offset = position ? position : this.position;
+        // debug(`readBuffer ${_offset}...${_offset + length - 1}`);
+        let offset = 0;
+        let length = buffer.length;
+        if (options) {
+            if (Number.isInteger(options.length)) {
+                length = options.length;
+            }
+            else {
+                length -= options.offset || 0;
+            }
+            if (options.position) {
+                const skipBytes = options.position - this.position;
+                if (skipBytes > 0) {
+                    await this.ignore(skipBytes);
+                    return this.readBuffer(buffer, options);
+                }
+                else if (skipBytes < 0) {
+                    throw new Error('`options.position` must be equal or greater than `tokenizer.position`');
+                }
+            }
+            if (options.offset) {
+                offset = options.offset;
+            }
+        }
+        if (length === 0) {
+            return 0;
+        }
+        const bytesRead = await this.streamReader.read(buffer, offset, length);
+        this.position += bytesRead;
+        if ((!options || !options.mayBeLess) && bytesRead < length) {
+            throw new peek_readable_1.EndOfStreamError();
+        }
+        return bytesRead;
+    }
+    /**
+     * Peek (read ahead) buffer from tokenizer
+     * @param buffer - Target buffer to write the data read to
+     * @param options - Read behaviour options
+     * @returns Promise with number of bytes peeked
+     */
+    async peekBuffer(buffer, options) {
+        // const _offset = position ? position : this.position;
+        // debug(`peek ${_offset}...${_offset + length - 1}`);
+        let offset = 0;
+        let bytesRead;
+        let length = buffer.length;
+        if (options) {
+            if (options.offset) {
+                offset = options.offset;
+            }
+            if (Number.isInteger(options.length)) {
+                length = options.length;
+            }
+            else {
+                length -= options.offset || 0;
+            }
+            if (options.position) {
+                const skipBytes = options.position - this.position;
+                if (skipBytes > 0) {
+                    const skipBuffer = Buffer.alloc(length + skipBytes);
+                    bytesRead = await this.peekBuffer(skipBuffer, { mayBeLess: options.mayBeLess });
+                    skipBuffer.copy(buffer, offset, skipBytes);
+                    return bytesRead - skipBytes;
+                }
+                else if (skipBytes < 0) {
+                    throw new Error('Cannot peek from a negative offset in a stream');
+                }
+            }
+        }
+        try {
+            bytesRead = await this.streamReader.peek(buffer, offset, length);
+        }
+        catch (err) {
+            if (options && options.mayBeLess && err instanceof peek_readable_1.EndOfStreamError) {
+                return 0;
+            }
+            throw err;
+        }
+        if ((!options || !options.mayBeLess) && bytesRead < length) {
+            throw new peek_readable_1.EndOfStreamError();
+        }
+        return bytesRead;
+    }
+    async ignore(length) {
+        // debug(`ignore ${this.position}...${this.position + length - 1}`);
+        const bufSize = Math.min(maxBufferSize, length);
+        const buf = Buffer.alloc(bufSize);
+        let totBytesRead = 0;
+        while (totBytesRead < length) {
+            const remaining = length - totBytesRead;
+            const bytesRead = await this.readBuffer(buf, { length: Math.min(bufSize, remaining) });
+            if (bytesRead < 0) {
+                return bytesRead;
+            }
+            totBytesRead += bytesRead;
+        }
+        return totBytesRead;
+    }
+}
+exports.ReadStreamTokenizer = ReadStreamTokenizer;
+//# sourceMappingURL=ReadStreamTokenizer.js.map
+
+/***/ }),
+
+/***/ 3026:
+/***/ ((__unused_webpack_module, exports, __webpack_require__) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.fromBuffer = exports.fromStream = void 0;
+const ReadStreamTokenizer_1 = __webpack_require__(8888);
+const BufferTokenizer_1 = __webpack_require__(8054);
+var peek_readable_1 = __webpack_require__(3752);
+Object.defineProperty(exports, "EndOfStreamError", ({ enumerable: true, get: function () { return peek_readable_1.EndOfStreamError; } }));
+/**
+ * Construct ReadStreamTokenizer from given Stream.
+ * Will set fileSize, if provided given Stream has set the .path property/
+ * @param stream - Read from Node.js Stream.Readable
+ * @param fileInfo - Pass the file information, like size and MIME-type of the correspnding stream.
+ * @returns ReadStreamTokenizer
+ */
+function fromStream(stream, fileInfo) {
+    fileInfo = fileInfo ? fileInfo : {};
+    return new ReadStreamTokenizer_1.ReadStreamTokenizer(stream, fileInfo);
+}
+exports.fromStream = fromStream;
+/**
+ * Construct ReadStreamTokenizer from given Buffer.
+ * @param buffer - Buffer to tokenize
+ * @param fileInfo - Pass additional file information to the tokenizer
+ * @returns BufferTokenizer
+ */
+function fromBuffer(buffer, fileInfo) {
+    return new BufferTokenizer_1.BufferTokenizer(buffer, fileInfo);
+}
+exports.fromBuffer = fromBuffer;
+//# sourceMappingURL=core.js.map
+
+/***/ }),
+
+/***/ 8569:
+/***/ ((__unused_webpack_module, exports, __webpack_require__) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.fromStream = void 0;
+const fs = __webpack_require__(3915);
+const core = __webpack_require__(3026);
+var FileTokenizer_1 = __webpack_require__(561);
+Object.defineProperty(exports, "fromFile", ({ enumerable: true, get: function () { return FileTokenizer_1.fromFile; } }));
+var core_1 = __webpack_require__(3026);
+Object.defineProperty(exports, "EndOfStreamError", ({ enumerable: true, get: function () { return core_1.EndOfStreamError; } }));
+Object.defineProperty(exports, "fromBuffer", ({ enumerable: true, get: function () { return core_1.fromBuffer; } }));
+/**
+ * Construct ReadStreamTokenizer from given Stream.
+ * Will set fileSize, if provided given Stream has set the .path property.
+ * @param stream - Node.js Stream.Readable
+ * @param fileInfo - Pass additional file information to the tokenizer
+ * @returns Tokenizer
+ */
+async function fromStream(stream, fileInfo) {
+    fileInfo = fileInfo ? fileInfo : {};
+    if (stream.path) {
+        const stat = await fs.stat(stream.path);
+        fileInfo.path = stream.path;
+        fileInfo.size = stat.size;
+    }
+    return core.fromStream(stream, fileInfo);
+}
+exports.fromStream = fromStream;
+//# sourceMappingURL=index.js.map
+
+/***/ }),
+
+/***/ 4261:
+/***/ ((__unused_webpack_module, exports, __webpack_require__) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+const assert = __webpack_require__(2357);
+const ieee754 = __webpack_require__(3092);
+// Primitive types
+/**
+ * 8-bit unsigned integer
+ */
+exports.UINT8 = {
+    len: 1,
+    get(buf, off) {
+        return buf.readUInt8(off);
+    },
+    put(buf, off, v) {
+        assert.equal(typeof off, 'number');
+        assert.equal(typeof v, 'number');
+        assert.ok(v >= 0 && v <= 0xff);
+        assert.ok(off >= 0);
+        assert.ok(this.len <= buf.length);
+        return buf.writeUInt8(v, off);
+    }
+};
+/**
+ * 16-bit unsigned integer, Little Endian byte order
+ */
+exports.UINT16_LE = {
+    len: 2,
+    get(buf, off) {
+        return buf.readUInt16LE(off);
+    },
+    put(buf, off, v) {
+        assert.equal(typeof off, 'number');
+        assert.equal(typeof v, 'number');
+        assert.ok(v >= 0 && v <= 0xffff);
+        assert.ok(off >= 0);
+        assert.ok(this.len <= buf.length);
+        return buf.writeUInt16LE(v, off);
+    }
+};
+/**
+ * 16-bit unsigned integer, Big Endian byte order
+ */
+exports.UINT16_BE = {
+    len: 2,
+    get(buf, off) {
+        return buf.readUInt16BE(off);
+    },
+    put(buf, off, v) {
+        assert.equal(typeof off, 'number');
+        assert.equal(typeof v, 'number');
+        assert.ok(v >= 0 && v <= 0xffff);
+        assert.ok(off >= 0);
+        assert.ok(this.len <= buf.length);
+        return buf.writeUInt16BE(v, off);
+    }
+};
+/**
+ * 24-bit unsigned integer, Little Endian byte order
+ */
+exports.UINT24_LE = {
+    len: 3,
+    get(buf, off) {
+        return buf.readUIntLE(off, 3);
+    },
+    put(buf, off, v) {
+        assert.equal(typeof off, 'number');
+        assert.equal(typeof v, 'number');
+        assert.ok(v >= 0 && v <= 0xffffff);
+        assert.ok(off >= 0);
+        assert.ok(this.len <= buf.length);
+        return buf.writeUIntLE(v, off, 3);
+    }
+};
+/**
+ * 24-bit unsigned integer, Big Endian byte order
+ */
+exports.UINT24_BE = {
+    len: 3,
+    get(buf, off) {
+        return buf.readUIntBE(off, 3);
+    },
+    put(buf, off, v) {
+        assert.equal(typeof off, 'number');
+        assert.equal(typeof v, 'number');
+        assert.ok(v >= 0 && v <= 0xffffff);
+        assert.ok(off >= 0);
+        assert.ok(this.len <= buf.length);
+        return buf.writeUIntBE(v, off, 3);
+    }
+};
+/**
+ * 32-bit unsigned integer, Little Endian byte order
+ */
+exports.UINT32_LE = {
+    len: 4,
+    get(buf, off) {
+        return buf.readUInt32LE(off);
+    },
+    put(b, o, v) {
+        assert.equal(typeof o, 'number');
+        assert.equal(typeof v, 'number');
+        assert.ok(v >= 0 && v <= 0xffffffff);
+        assert.ok(o >= 0);
+        assert.ok(this.len <= b.length);
+        return b.writeUInt32LE(v, o);
+    }
+};
+/**
+ * 32-bit unsigned integer, Big Endian byte order
+ */
+exports.UINT32_BE = {
+    len: 4,
+    get(buf, off) {
+        return buf.readUInt32BE(off);
+    },
+    put(buf, off, v) {
+        assert.equal(typeof off, 'number');
+        assert.equal(typeof v, 'number');
+        assert.ok(v >= 0 && v <= 0xffffffff);
+        assert.ok(off >= 0);
+        assert.ok(this.len <= buf.length);
+        return buf.writeUInt32BE(v, off);
+    }
+};
+/**
+ * 8-bit signed integer
+ */
+exports.INT8 = {
+    len: 1,
+    get(buf, off) {
+        return buf.readInt8(off);
+    },
+    put(buf, off, v) {
+        assert.equal(typeof off, 'number');
+        assert.equal(typeof v, 'number');
+        assert.ok(v >= -128 && v <= 127);
+        assert.ok(off >= 0);
+        assert.ok(this.len <= buf.length);
+        return buf.writeInt8(v, off);
+    }
+};
+/**
+ * 16-bit signed integer, Big Endian byte order
+ */
+exports.INT16_BE = {
+    len: 2,
+    get(buf, off) {
+        return buf.readInt16BE(off);
+    },
+    put(b, o, v) {
+        assert.equal(typeof o, 'number');
+        assert.equal(typeof v, 'number');
+        assert.ok(v >= -32768 && v <= 32767);
+        assert.ok(o >= 0);
+        assert.ok(this.len <= b.length);
+        return b.writeInt16BE(v, o);
+    }
+};
+/**
+ * 16-bit signed integer, Little Endian byte order
+ */
+exports.INT16_LE = {
+    len: 2,
+    get(buf, off) {
+        return buf.readInt16LE(off);
+    },
+    put(b, o, v) {
+        assert.equal(typeof o, 'number');
+        assert.equal(typeof v, 'number');
+        assert.ok(v >= -32768 && v <= 32767);
+        assert.ok(o >= 0);
+        assert.ok(this.len <= b.length);
+        return b.writeInt16LE(v, o);
+    }
+};
+/**
+ * 24-bit signed integer, Little Endian byte order
+ */
+exports.INT24_LE = {
+    len: 3,
+    get(buf, off) {
+        return buf.readIntLE(off, 3);
+    },
+    put(b, o, v) {
+        assert.equal(typeof o, 'number');
+        assert.equal(typeof v, 'number');
+        assert.ok(v >= -0x800000 && v <= 0x7fffff);
+        assert.ok(o >= 0);
+        assert.ok(this.len <= b.length);
+        return b.writeIntLE(v, o, 3);
+    }
+};
+/**
+ * 24-bit signed integer, Big Endian byte order
+ */
+exports.INT24_BE = {
+    len: 3,
+    get(buf, off) {
+        return buf.readIntBE(off, 3);
+    },
+    put(b, o, v) {
+        assert.equal(typeof o, 'number');
+        assert.equal(typeof v, 'number');
+        assert.ok(v >= -0x800000 && v <= 0x7fffff);
+        assert.ok(o >= 0);
+        assert.ok(this.len <= b.length);
+        return b.writeIntBE(v, o, 3);
+    }
+};
+/**
+ * 32-bit signed integer, Big Endian byte order
+ */
+exports.INT32_BE = {
+    len: 4,
+    get(buf, off) {
+        return buf.readInt32BE(off);
+    },
+    put(b, o, v) {
+        assert.equal(typeof o, 'number');
+        assert.equal(typeof v, 'number');
+        assert.ok(v >= -2147483648 && v <= 2147483647);
+        assert.ok(o >= 0);
+        assert.ok(this.len <= b.length);
+        return b.writeInt32BE(v, o);
+    }
+};
+/**
+ * 32-bit signed integer, Big Endian byte order
+ */
+exports.INT32_LE = {
+    len: 4,
+    get(buf, off) {
+        return buf.readInt32LE(off);
+    },
+    put(b, o, v) {
+        assert.equal(typeof o, 'number');
+        assert.equal(typeof v, 'number');
+        assert.ok(v >= -2147483648 && v <= 2147483647);
+        assert.ok(o >= 0);
+        assert.ok(this.len <= b.length);
+        return b.writeInt32LE(v, o);
+    }
+};
+/**
+ * 64-bit unsigned integer, Little Endian byte order
+ */
+exports.UINT64_LE = {
+    len: 8,
+    get(buf, off) {
+        return readUIntLE(buf, off, this.len);
+    },
+    put(b, o, v) {
+        return writeUIntLE(b, v, o, this.len);
+    }
+};
+/**
+ * 64-bit signed integer, Little Endian byte order
+ */
+exports.INT64_LE = {
+    len: 8,
+    get(buf, off) {
+        return readIntLE(buf, off, this.len);
+    },
+    put(b, off, v) {
+        return writeIntLE(b, v, off, this.len);
+    }
+};
+/**
+ * 64-bit unsigned integer, Big Endian byte order
+ */
+exports.UINT64_BE = {
+    len: 8,
+    get(b, off) {
+        return readUIntBE(b, off, this.len);
+    },
+    put(b, o, v) {
+        return writeUIntBE(b, v, o, this.len);
+    }
+};
+/**
+ * 64-bit signed integer, Big Endian byte order
+ */
+exports.INT64_BE = {
+    len: 8,
+    get(b, off) {
+        return readIntBE(b, off, this.len);
+    },
+    put(b, off, v) {
+        return writeIntBE(b, v, off, this.len);
+    }
+};
+/**
+ * IEEE 754 16-bit (half precision) float, big endian
+ */
+exports.Float16_BE = {
+    len: 2,
+    get(b, off) {
+        return ieee754.read(b, off, false, 10, this.len);
+    },
+    put(b, off, v) {
+        return ieee754.write(b, v, off, false, 10, this.len);
+    }
+};
+/**
+ * IEEE 754 16-bit (half precision) float, little endian
+ */
+exports.Float16_LE = {
+    len: 2,
+    get(b, off) {
+        return ieee754.read(b, off, true, 10, this.len);
+    },
+    put(b, off, v) {
+        return ieee754.write(b, v, off, true, 10, this.len);
+    }
+};
+/**
+ * IEEE 754 32-bit (single precision) float, big endian
+ */
+exports.Float32_BE = {
+    len: 4,
+    get(b, off) {
+        return b.readFloatBE(off);
+    },
+    put(b, off, v) {
+        return b.writeFloatBE(v, off);
+    }
+};
+/**
+ * IEEE 754 32-bit (single precision) float, little endian
+ */
+exports.Float32_LE = {
+    len: 4,
+    get(b, off) {
+        return b.readFloatLE(off);
+    },
+    put(b, off, v) {
+        return b.writeFloatLE(v, off);
+    }
+};
+/**
+ * IEEE 754 64-bit (double precision) float, big endian
+ */
+exports.Float64_BE = {
+    len: 8,
+    get(b, off) {
+        return b.readDoubleBE(off);
+    },
+    put(b, off, v) {
+        return b.writeDoubleBE(v, off);
+    }
+};
+/**
+ * IEEE 754 64-bit (double precision) float, little endian
+ */
+exports.Float64_LE = {
+    len: 8,
+    get(b, off) {
+        return b.readDoubleLE(off);
+    },
+    put(b, off, v) {
+        return b.writeDoubleLE(v, off);
+    }
+};
+/**
+ * IEEE 754 80-bit (extended precision) float, big endian
+ */
+exports.Float80_BE = {
+    len: 10,
+    get(b, off) {
+        return ieee754.read(b, off, false, 63, this.len);
+    },
+    put(b, off, v) {
+        return ieee754.write(b, v, off, false, 63, this.len);
+    }
+};
+/**
+ * IEEE 754 80-bit (extended precision) float, little endian
+ */
+exports.Float80_LE = {
+    len: 10,
+    get(b, off) {
+        return ieee754.read(b, off, true, 63, this.len);
+    },
+    put(b, off, v) {
+        return ieee754.write(b, v, off, true, 63, this.len);
+    }
+};
+/**
+ * Ignore a given number of bytes
+ */
+class IgnoreType {
+    /**
+     * @param len number of bytes to ignore
+     */
+    constructor(len) {
+        this.len = len;
+    }
+    // ToDo: don't read, but skip data
+    get(buf, off) {
+    }
+}
+exports.IgnoreType = IgnoreType;
+class BufferType {
+    constructor(len) {
+        this.len = len;
+    }
+    get(buf, off) {
+        return buf.slice(off, off + this.len);
+    }
+}
+exports.BufferType = BufferType;
+/**
+ * Consume a fixed number of bytes from the stream and return a string with a specified encoding.
+ */
+class StringType {
+    constructor(len, encoding) {
+        this.len = len;
+        this.encoding = encoding;
+    }
+    get(buf, off) {
+        return buf.toString(this.encoding, off, off + this.len);
+    }
+}
+exports.StringType = StringType;
+/**
+ * ANSI Latin 1 String
+ * Using windows-1252 / ISO 8859-1 decoding
+ */
+class AnsiStringType {
+    constructor(len) {
+        this.len = len;
+    }
+    static decode(buffer, off, until) {
+        let str = '';
+        for (let i = off; i < until; ++i) {
+            str += AnsiStringType.codePointToString(AnsiStringType.singleByteDecoder(buffer[i]));
+        }
+        return str;
+    }
+    static inRange(a, min, max) {
+        return min <= a && a <= max;
+    }
+    static codePointToString(cp) {
+        if (cp <= 0xFFFF) {
+            return String.fromCharCode(cp);
+        }
+        else {
+            cp -= 0x10000;
+            return String.fromCharCode((cp >> 10) + 0xD800, (cp & 0x3FF) + 0xDC00);
+        }
+    }
+    static singleByteDecoder(bite) {
+        if (AnsiStringType.inRange(bite, 0x00, 0x7F)) {
+            return bite;
+        }
+        const codePoint = AnsiStringType.windows1252[bite - 0x80];
+        if (codePoint === null) {
+            throw Error('invaliding encoding');
+        }
+        return codePoint;
+    }
+    get(buf, off = 0) {
+        return AnsiStringType.decode(buf, off, off + this.len);
+    }
+}
+exports.AnsiStringType = AnsiStringType;
+AnsiStringType.windows1252 = [8364, 129, 8218, 402, 8222, 8230, 8224, 8225, 710, 8240, 352,
+    8249, 338, 141, 381, 143, 144, 8216, 8217, 8220, 8221, 8226, 8211, 8212, 732,
+    8482, 353, 8250, 339, 157, 382, 376, 160, 161, 162, 163, 164, 165, 166, 167, 168,
+    169, 170, 171, 172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 182, 183, 184,
+    185, 186, 187, 188, 189, 190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 200,
+    201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216,
+    217, 218, 219, 220, 221, 222, 223, 224, 225, 226, 227, 228, 229, 230, 231, 232,
+    233, 234, 235, 236, 237, 238, 239, 240, 241, 242, 243, 244, 245, 246, 247,
+    248, 249, 250, 251, 252, 253, 254, 255];
+/**
+ * Best effort approach to read up to 64 bit unsigned integer, little endian.
+ * Note that JavasScript is limited to 2^53 - 1 bit.
+ */
+function readUIntLE(buf, offset, byteLength) {
+    offset = offset >>> 0;
+    byteLength = byteLength >>> 0;
+    let val = buf[offset];
+    let mul = 1;
+    let i = 0;
+    while (++i < byteLength && (mul *= 0x100)) {
+        val += buf[offset + i] * mul;
+    }
+    return val;
+}
+/**
+ * Best effort approach to write up to 64 bit unsigned integer, little endian.
+ * Note that JavasScript is limited to 2^53 - 1 bit.
+ */
+function writeUIntLE(buf, value, offset, byteLength) {
+    value = +value;
+    offset = offset >>> 0;
+    byteLength = byteLength >>> 0;
+    let mul = 1;
+    let i = 0;
+    buf[offset] = value & 0xFF;
+    while (++i < byteLength && (mul *= 0x100)) {
+        buf[offset + i] = (value / mul) & 0xFF;
+    }
+    return offset + byteLength;
+}
+/**
+ * Best effort approach to read 64 but signed integer, little endian.
+ * Note that JavasScript is limited to 2^53 - 1 bit.
+ */
+function readIntLE(buf, offset, byteLength) {
+    offset = offset >>> 0;
+    byteLength = byteLength >>> 0;
+    let val = buf[offset];
+    let mul = 1;
+    let i = 0;
+    while (++i < byteLength && (mul *= 0x100)) {
+        val += buf[offset + i] * mul;
+    }
+    mul *= 0x80;
+    if (val >= mul)
+        val -= Math.pow(2, 8 * byteLength);
+    return val;
+}
+/**
+ * Best effort approach to write 64 but signed integer, little endian.
+ * Note that JavasScript is limited to 2^53 - 1 bit.
+ */
+function writeIntLE(buf, value, offset, byteLength) {
+    value = +value;
+    offset = offset >>> 0;
+    let i = 0;
+    let mul = 1;
+    let sub = 0;
+    buf[offset] = value & 0xFF;
+    while (++i < byteLength && (mul *= 0x100)) {
+        if (value < 0 && sub === 0 && buf[offset + i - 1] !== 0) {
+            sub = 1;
+        }
+        buf[offset + i] = ((value / mul) >> 0) - sub & 0xFF;
+    }
+    return offset + byteLength;
+}
+exports.writeIntLE = writeIntLE;
+/**
+ * Best effort approach to read up to 64 bit unsigned integer, big endian.
+ * Note that JavasScript is limited to 2^53 - 1 bit.
+ */
+function readUIntBE(buf, offset, byteLength) {
+    offset = offset >>> 0;
+    byteLength = byteLength >>> 0;
+    let val = buf[offset + --byteLength];
+    let mul = 1;
+    while (byteLength > 0 && (mul *= 0x100)) {
+        val += buf[offset + --byteLength] * mul;
+    }
+    return val;
+}
+exports.readUIntBE = readUIntBE;
+/**
+ * Best effort approach to write up to 64 bit unsigned integer, big endian.
+ * Note that JavasScript is limited to 2^53 - 1 bit.
+ */
+function writeUIntBE(buf, value, offset, byteLength) {
+    value = +value;
+    offset = offset >>> 0;
+    byteLength = byteLength >>> 0;
+    let i = byteLength - 1;
+    let mul = 1;
+    buf[offset + i] = value & 0xFF;
+    while (--i >= 0 && (mul *= 0x100)) {
+        buf[offset + i] = (value / mul) & 0xFF;
+    }
+    return offset + byteLength;
+}
+exports.writeUIntBE = writeUIntBE;
+/**
+ * Best effort approach to read 64 but signed integer, big endian.
+ * Note that JavasScript is limited to 2^53 - 1 bit.
+ */
+function readIntBE(buf, offset, byteLength) {
+    offset = offset >>> 0;
+    byteLength = byteLength >>> 0;
+    let i = byteLength;
+    let mul = 1;
+    let val = buf[offset + --i];
+    while (i > 0 && (mul *= 0x100)) {
+        val += buf[offset + --i] * mul;
+    }
+    mul *= 0x80;
+    if (val >= mul)
+        val -= Math.pow(2, 8 * byteLength);
+    return val;
+}
+exports.readIntBE = readIntBE;
+/**
+ * Best effort approach to write 64 but signed integer, big endian.
+ * Note that JavasScript is limited to 2^53 - 1 bit.
+ */
+function writeIntBE(buf, value, offset, byteLength) {
+    value = +value;
+    offset = offset >>> 0;
+    let i = byteLength - 1;
+    let mul = 1;
+    let sub = 0;
+    buf[offset + i] = value & 0xFF;
+    while (--i >= 0 && (mul *= 0x100)) {
+        if (value < 0 && sub === 0 && buf[offset + i + 1] !== 0) {
+            sub = 1;
+        }
+        buf[offset + i] = ((value / mul) >> 0) - sub & 0xFF;
+    }
+    return offset + byteLength;
+}
+exports.writeIntBE = writeIntBE;
+//# sourceMappingURL=index.js.map
 
 /***/ }),
 
